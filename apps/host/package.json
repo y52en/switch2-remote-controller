@@ -1,0 +1,19 @@
+{
+  "name": "@switch2-remote/host",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node server.mjs",
+    "test": "node --test controller-state.test.mjs config.test.mjs easycon.test.mjs input-reliability.test.mjs keymap.test.mjs gamepad-map.test.mjs transport.test.mjs rumble.test.mjs haptics.test.mjs",
+    "test:cloudflare": "node cloudflare-signaling.test.mjs"
+  },
+  "dependencies": {
+    "dotenv": "^17.2.1",
+    "serialport": "^13.0.0",
+    "ws": "^8.18.3"
+  },
+  "engines": {
+    "node": ">=24"
+  }
+}

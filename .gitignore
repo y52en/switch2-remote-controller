@@ -1,0 +1,44 @@
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+.dev.vars
+.dev.vars.*
+!.dev.vars.example
+
+# JavaScript
+node_modules/
+npm-debug.log*
+
+# Python and uv
+.venv/
+__pycache__/
+*.py[cod]
+
+# Firmware and PlatformIO
+.cache/
+.pio/
+sdkconfig.*
+!sdkconfig.defaults
+!sdkconfig.*.defaults
+dependencies.lock
+*.bin
+*.elf
+*.map
+
+# Cloudflare
+.wrangler/
+
+# Editors, logs, and raw media
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.log
+docs/assets/raw/
+*.mp4
+*.mov
+
+# One-time local import archives
+.apps-import.zip
+.firmware-import.zip

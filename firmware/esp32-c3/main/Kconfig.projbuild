@@ -1,0 +1,62 @@
+menu "NSController Configuration"
+
+    config MCU_DEBUG
+        bool "Enable MCU debug logging"
+        default n
+        help
+            Enable detailed debug output for MCU operations.
+
+    config SAVE_PAIRING_INFO
+        bool "Save pairing information"
+        default y
+        help
+            Save pairing information to flash memory for future use.
+
+    config HID_REPORT_INTERVAL
+        int "HID Report Interval (ms)"
+        default 15
+        range 5 100
+        help
+            Interval between HID report transmissions in milliseconds.
+            Lower values provide lower latency but require more CPU processing.
+            For ESP32-C3 (single-core), higher values may reduce mbuf pressure.
+
+    config REMOTE_DISPLAY_GC9A01
+        bool "Enable the optional GC9A01 status display"
+        default n
+        help
+            Enable the 240x240 round LCD found on the 2424S012C board.
+            Leave disabled on generic ESP32-C3 boards; no display GPIO or SPI
+            peripheral is initialized in the headless build.
+
+    config REMOTE_LCD_RST_PIN
+        int "GC9A01 reset GPIO"
+        depends on REMOTE_DISPLAY_GC9A01
+        default 1
+
+    config REMOTE_LCD_DC_PIN
+        int "GC9A01 data/command GPIO"
+        depends on REMOTE_DISPLAY_GC9A01
+        default 2
+
+    config REMOTE_LCD_BL_PIN
+        int "GC9A01 backlight GPIO"
+        depends on REMOTE_DISPLAY_GC9A01
+        default 3
+
+    config REMOTE_LCD_SCK_PIN
+        int "GC9A01 clock GPIO"
+        depends on REMOTE_DISPLAY_GC9A01
+        default 6
+
+    config REMOTE_LCD_MOSI_PIN
+        int "GC9A01 MOSI GPIO"
+        depends on REMOTE_DISPLAY_GC9A01
+        default 7
+
+    config REMOTE_LCD_CS_PIN
+        int "GC9A01 chip-select GPIO"
+        depends on REMOTE_DISPLAY_GC9A01
+        default 10
+
+endmenu

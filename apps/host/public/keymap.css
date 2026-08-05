@@ -1,0 +1,10 @@
+.key-settings { margin: 12px 0 22px; border: 1px solid #2b3342; border-radius: 16px; background: #0e131c; }
+.key-settings summary { padding: 14px 16px; cursor: pointer; color: #c8d2e2; font-weight: 650; }
+.key-settings-body { padding: 0 16px 16px; }
+.key-bindings { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 8px; }
+.key-binding { display: grid; grid-template-columns: minmax(76px, 1fr) minmax(76px, 1fr); align-items: center; gap: 8px; padding: 8px; border: 1px solid #293242; border-radius: 10px; background: #0a0e15; }
+.key-binding span { font-weight: 750; text-align: center; color: #dce6f5; }
+.key-binding button, #reset-key-bindings, #reset-gamepad-bindings { min-width: 0; min-height: 38px; border-radius: 9px; padding: 0 10px; box-shadow: none; font-size: 13px; }
+.key-binding button.capturing { color: #ffd479; border-color: #80682f; }
+#reset-key-bindings, #reset-gamepad-bindings { margin-top: 12px; }
+@media (max-width: 520px) { .key-bindings { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
