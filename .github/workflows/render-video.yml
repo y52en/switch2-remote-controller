@@ -12,11 +12,9 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 24
-          cache: npm
-          cache-dependency-path: video/package-lock.json
       - name: Install video dependencies
         working-directory: video
-        run: npm install --package-lock-only && npm ci
+        run: npm install
       - name: Render MP4 and poster
         working-directory: video
         run: |
