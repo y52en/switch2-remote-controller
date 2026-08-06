@@ -110,6 +110,15 @@ npm run start:host
 npm run dev:signaling
 ```
 
+ローカルWorkerは`http://127.0.0.1:8788`で待ち受けるため、8787のホストと
+同時に起動できます。
+
+リポジトリ直下からWorkerをデプロイできます。
+
+```sh
+npm run deploy
+```
+
 デプロイ手順は[services/signaling/README.md](services/signaling/README.md)を参照して
 ください。TURN認証情報はコミットせず、Wrangler secretsへ登録します。Workerは
 静的assets、`ROOMS`というDurable Object binding、任意の`TURN_KEY_ID` /

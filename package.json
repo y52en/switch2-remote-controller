@@ -9,6 +9,7 @@
   "scripts": {
     "start:host": "npm start --workspace @switch2-remote/host",
     "dev:signaling": "npm run dev --workspace @switch2-remote/signaling",
+    "deploy": "npm run deploy --workspace @switch2-remote/signaling",
     "test": "npm test --workspace @switch2-remote/host",
     "test:cloudflare": "npm run test:cloudflare --workspace @switch2-remote/host",
     "check:signaling": "npm run check --workspace @switch2-remote/signaling",

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import re
+import subprocess
 import sys
 
 
@@ -22,6 +23,20 @@ FORBIDDEN_PATTERNS = {
 
 
 def files():
+    tracked = subprocess.run(
+        ["git", "ls-files", "-z"],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+    )
+    if tracked.returncode == 0:
+        for relative in tracked.stdout.split("\0"):
+            if relative:
+                yield ROOT / relative
+        return
+
     for path in ROOT.rglob("*"):
         if not path.is_file() or any(part in SKIP_DIRS for part in path.parts):
             continue

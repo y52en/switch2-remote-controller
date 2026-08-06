@@ -113,6 +113,15 @@ run.
 npm run dev:signaling
 ```
 
+The local Worker listens on `http://127.0.0.1:8788`, so it can run alongside
+the host bridge on port 8787.
+
+Deploy the Worker from the repository root with:
+
+```sh
+npm run deploy
+```
+
 For deployment, see [services/signaling/README.md](services/signaling/README.md).
 TURN credentials must be stored with Wrangler secrets rather than committed to
 the repository. The Worker configuration provides static assets, one Durable
