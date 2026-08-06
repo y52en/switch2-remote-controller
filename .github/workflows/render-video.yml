@@ -1,0 +1,29 @@
+name: Render explanation video
+
+on:
+  workflow_dispatch:
+
+jobs:
+  render:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Install video dependencies
+        working-directory: video
+        run: npm install
+      - name: Render MP4 and poster
+        working-directory: video
+        run: |
+          npm run render
+          npm run still
+      - uses: actions/upload-artifact@v4
+        with:
+          name: switch2-remote-controller-video
+          path: |
+            video/out/switch2-remote-controller.mp4
+            video/out/poster.png
+          if-no-files-found: error
