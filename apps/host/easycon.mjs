@@ -1,8 +1,18 @@
+import { CONTROLLER_SLOT_COUNT } from "./controller-slots.mjs";
+
 const RAW_SIZE = 7;
 const ENCODED_SIZE = 8;
+export const EASYCON_CONTROLLER_SLOT_COUNT = CONTROLLER_SLOT_COUNT;
+export const EASYCON_BUTTON_MASK = 0x3fff;
 
-export function encodeEasyConState(state) {
-  const buttons = Number(state.buttons) & 0xffff;
+export function encodeEasyConState(state, slot = 0) {
+  if (!Number.isInteger(slot) || slot < 0 || slot >= EASYCON_CONTROLLER_SLOT_COUNT) {
+    throw new RangeError(`controller slot must be from 0 to ${EASYCON_CONTROLLER_SLOT_COUNT - 1}`);
+  }
+  // EasyCon has two unused button bits. Carry the virtual-controller slot in
+  // those bits so the on-wire frame remains eight bytes and old slot-0 hosts
+  // remain compatible with the new firmware.
+  const buttons = (Number(state.buttons) & EASYCON_BUTTON_MASK) | (slot << 14);
   const raw = Uint8Array.of(
     buttons >>> 8,
     buttons,

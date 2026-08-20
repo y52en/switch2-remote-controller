@@ -37,9 +37,18 @@ static esp_err_t pro2_ltk_init(nvs_handle_t nvs_handle) {
   esp_err_t ret;
   ret = nvs_get_blob(nvs_handle, NVS_KEY_LTK, g_controller_firmware.ltk, &(size_t){LTK_KEY_SIZE});
   if (ret != ESP_OK) {
-    ESP_LOGE(LOG_BLE_NVS, "Failed to get LTK from NVS");
+    // Pick one shared target key before any of the three virtual identities is
+    // paired. The pairing response derives a per-exchange B1 value which makes
+    // every identity converge on this same LTK, matching NimBLE's peer-keyed
+    // security store.
+    esp_fill_random(g_controller_firmware.ltk, LTK_KEY_SIZE);
+    reverse_bytes(g_controller_firmware.ltk, g_controller_firmware.ltk_re,
+                  LTK_KEY_SIZE);
+    g_controller_firmware.pairing_saved = false;
+    ESP_LOGW(LOG_BLE_NVS, "No saved LTK; generated shared multi-controller key");
   } else {
     reverse_bytes(g_controller_firmware.ltk, g_controller_firmware.ltk_re, LTK_KEY_SIZE);
+    g_controller_firmware.pairing_saved = true;
     ESP_LOGI(LOG_BLE_NVS, "LTK loaded and reversed successfully");
   }
   return ret;
@@ -50,6 +59,7 @@ int pro2_device_init(nvs_handle_t nvs_handle) {
     esp_err_t ltk_ret;
     ret = pro2_addr_init(nvs_handle);
     if (ret == ESP_OK) {
+        controller_addresses_init();
         // set esp ble stack mac addr, public address
         ret = esp_iface_mac_addr_set(g_controller_firmware.addr, ESP_MAC_BT);
         if (ret != ESP_OK) {
@@ -84,7 +94,8 @@ int pro2_device_init(nvs_handle_t nvs_handle) {
     return ret;
 }
 
-static int pro2_pairing_info_nvs_save() {
+static int pro2_pairing_info_nvs_save(uint8_t slot) {
+  if (slot >= CONTROLLER_SLOT_COUNT) return ESP_ERR_INVALID_ARG;
   nvs_handle_t nvs_handle;
   esp_err_t ret;
   const char* pairing_ns = NVS_NAME_PAIRING_PRO2;
@@ -101,7 +112,8 @@ static int pro2_pairing_info_nvs_save() {
     return ret;
   }
 
-  ret = nvs_set_blob(nvs_handle, NVS_KEY_HOST_ADDR, g_console_ns2.ble_addr.val, ESP_BD_ADDR_LEN);
+  ret = nvs_set_blob(nvs_handle, NVS_KEY_HOST_ADDR,
+                     g_console_ns2s[slot].ble_addr.val, ESP_BD_ADDR_LEN);
   if (ret != ESP_OK) {
     ESP_LOGE(LOG_BLE_NVS, "Failed to save NS2 addr to NVS");
     nvs_close(nvs_handle);
@@ -113,15 +125,16 @@ static int pro2_pairing_info_nvs_save() {
     ESP_LOGE(LOG_BLE_NVS, "Failed to commit Pairing Info to NVS");
   }
   nvs_close(nvs_handle);
+  if (ret == ESP_OK) g_controller_firmware.pairing_saved = true;
   return ret;
 }
 
-int pro2_pairing_info_save() {
+int pro2_pairing_info_save(uint8_t slot) {
   if (g_controller_firmware.type != CONTROLLER_TYPE_PRO2) {
     return 0;
   }
   #ifdef CONFIG_SAVE_PAIRING_INFO
-    return pro2_pairing_info_nvs_save();
+    return pro2_pairing_info_nvs_save(slot);
   #endif
   return 0;
 }
@@ -148,6 +161,7 @@ int pro2_pairing_info_nvs_erase() {
     ESP_LOGE(LOG_BLE_NVS, "Failed to commit erased NVS namespace: %s", pairing_ns);
   }
   nvs_close(nvs_handle);
+  if (ret == ESP_OK) g_controller_firmware.pairing_saved = false;
   return ret;
 }
 

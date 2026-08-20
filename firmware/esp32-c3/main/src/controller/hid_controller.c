@@ -6,42 +6,8 @@
 
 #include <string.h>
 #include <stdlib.h>
+#include <stdio.h>
 #include "freertos/queue.h"
-
-// Global controller instance
-controller_handle_t g_hid_controller = {
-    .ops = &controller_ops,
-    .hid_ops = NULL,
-    .type = CONTROLLER_TYPE_PRO2,       // default pro2
-    .buffer = {
-        .front_buffer = NULL,
-        .back_buffer = NULL,
-        .swap_request = 0
-    },
-    .task_handle = NULL,
-    .ns2_notification_handle = NS2_NOTIFICATION_HANDLE
-};
-
-static bool s_hid_notify_pending = false;
-static bool s_hid_report_dirty = true;
-static uint16_t s_msys_free_ceiling = 0;
-static uint32_t s_hid_congestion_skips = 0;
-static uint32_t s_hid_pending_skips = 0;
-static uint32_t s_hid_notify_completions = 0;
-static TickType_t s_last_hid_send_tick = 0;
-static TickType_t s_hid_notify_started_tick = 0;
-static uint16_t s_hid_notify_free_before = 0;
-static TickType_t s_hid_congestion_started_tick = 0;
-static TickType_t s_hid_delivery_stall_started_tick = 0;
-static uint32_t s_hid_notify_buttons = 0;
-static bool s_hid_notify_buttons_valid = false;
-static uint32_t s_hid_completed_buttons = 0;
-static bool s_hid_completed_buttons_valid = false;
-static TickType_t s_hid_button_pressed_tick[24] = {0};
-static uint32_t s_hid_pressed_tick_valid = 0;
-static TickType_t s_hid_last_host_input_tick = 0;
-static bool s_hid_host_input_seen = false;
-static bool s_hid_host_input_timed_out = false;
 
 #define HID_STATE_QUEUE_CAPACITY 32
 #define HID_STATE_MAX_REPORT_SIZE 64
@@ -50,11 +16,88 @@ typedef struct {
     uint8_t report[HID_STATE_MAX_REPORT_SIZE];
 } hid_state_snapshot_t;
 
-static QueueHandle_t s_hid_state_queue = NULL;
-static uint32_t s_hid_state_queue_drops = 0;
-static hid_state_snapshot_t s_hid_last_queued_state;
-static size_t s_hid_last_queued_size = 0;
-static bool s_hid_last_queued_valid = false;
+typedef struct {
+    bool hid_notify_pending;
+    bool hid_report_dirty;
+    uint16_t msys_free_ceiling;
+    uint32_t hid_congestion_skips;
+    uint32_t hid_pending_skips;
+    uint32_t hid_notify_completions;
+    TickType_t last_hid_send_tick;
+    TickType_t hid_notify_started_tick;
+    uint16_t hid_notify_free_before;
+    TickType_t hid_congestion_started_tick;
+    TickType_t hid_delivery_stall_started_tick;
+    uint32_t hid_notify_buttons;
+    bool hid_notify_buttons_valid;
+    uint32_t hid_completed_buttons;
+    bool hid_completed_buttons_valid;
+    TickType_t hid_button_pressed_tick[24];
+    uint32_t hid_pressed_tick_valid;
+    TickType_t hid_last_host_input_tick;
+    bool hid_host_input_seen;
+    bool hid_host_input_timed_out;
+    QueueHandle_t hid_state_queue;
+    uint32_t hid_state_queue_drops;
+    hid_state_snapshot_t hid_last_queued_state;
+    size_t hid_last_queued_size;
+    bool hid_last_queued_valid;
+} hid_runtime_t;
+
+#define CONTROLLER_HANDLE_INIT(SLOT) { \
+    .ops = &controller_ops, .hid_ops = NULL, \
+    .type = CONTROLLER_TYPE_PRO2, \
+    .buffer = { .front_buffer = NULL, .back_buffer = NULL, .swap_request = 0 }, \
+    .task_handle = NULL, .ns2_notification_handle = NS2_NOTIFICATION_HANDLE, \
+    .conn_handle = BLE_HS_CONN_HANDLE_NONE, .slot = (SLOT), \
+    .notify_enabled = false, .runtime = NULL \
+}
+
+controller_handle_t g_hid_controllers[CONTROLLER_SLOT_COUNT] = {
+    CONTROLLER_HANDLE_INIT(0),
+    CONTROLLER_HANDLE_INIT(1),
+    CONTROLLER_HANDLE_INIT(2),
+};
+
+controller_handle_t *controller_hid_for_slot(uint8_t slot) {
+    return slot < CONTROLLER_SLOT_COUNT ? &g_hid_controllers[slot] : NULL;
+}
+
+controller_handle_t *controller_hid_for_conn(uint16_t conn_handle) {
+    if (conn_handle == BLE_HS_CONN_HANDLE_NONE) return NULL;
+    for (uint8_t slot = 0; slot < CONTROLLER_SLOT_COUNT; slot++) {
+        if (g_hid_controllers[slot].conn_handle == conn_handle) {
+            return &g_hid_controllers[slot];
+        }
+    }
+    return NULL;
+}
+
+#define s_hid_notify_pending (rt->hid_notify_pending)
+#define s_hid_report_dirty (rt->hid_report_dirty)
+#define s_msys_free_ceiling (rt->msys_free_ceiling)
+#define s_hid_congestion_skips (rt->hid_congestion_skips)
+#define s_hid_pending_skips (rt->hid_pending_skips)
+#define s_hid_notify_completions (rt->hid_notify_completions)
+#define s_last_hid_send_tick (rt->last_hid_send_tick)
+#define s_hid_notify_started_tick (rt->hid_notify_started_tick)
+#define s_hid_notify_free_before (rt->hid_notify_free_before)
+#define s_hid_congestion_started_tick (rt->hid_congestion_started_tick)
+#define s_hid_delivery_stall_started_tick (rt->hid_delivery_stall_started_tick)
+#define s_hid_notify_buttons (rt->hid_notify_buttons)
+#define s_hid_notify_buttons_valid (rt->hid_notify_buttons_valid)
+#define s_hid_completed_buttons (rt->hid_completed_buttons)
+#define s_hid_completed_buttons_valid (rt->hid_completed_buttons_valid)
+#define s_hid_button_pressed_tick (rt->hid_button_pressed_tick)
+#define s_hid_pressed_tick_valid (rt->hid_pressed_tick_valid)
+#define s_hid_last_host_input_tick (rt->hid_last_host_input_tick)
+#define s_hid_host_input_seen (rt->hid_host_input_seen)
+#define s_hid_host_input_timed_out (rt->hid_host_input_timed_out)
+#define s_hid_state_queue (rt->hid_state_queue)
+#define s_hid_state_queue_drops (rt->hid_state_queue_drops)
+#define s_hid_last_queued_state (rt->hid_last_queued_state)
+#define s_hid_last_queued_size (rt->hid_last_queued_size)
+#define s_hid_last_queued_valid (rt->hid_last_queued_valid)
 
 #define HID_KEEPALIVE_INTERVAL_MS 50
 #define HID_NOTIFY_RECOVERY_MS 50
@@ -97,7 +140,7 @@ static void hid_report_set_buttons(uint8_t *report, size_t report_size,
     report[HID_INPUT_STATE_OFFSET + 2] = (uint8_t)(buttons >> 16);
 }
 
-static void hid_reset_delivery_timing(void) {
+static void hid_reset_delivery_timing(hid_runtime_t *rt) {
     s_hid_congestion_started_tick = 0;
     s_hid_delivery_stall_started_tick = 0;
     s_hid_notify_buttons = 0;
@@ -108,7 +151,7 @@ static void hid_reset_delivery_timing(void) {
     s_hid_pressed_tick_valid = 0;
 }
 
-static void hid_note_completed_buttons(TickType_t now) {
+static void hid_note_completed_buttons(hid_runtime_t *rt, TickType_t now) {
     if (!s_hid_notify_buttons_valid) return;
     uint32_t previous = s_hid_completed_buttons_valid
         ? s_hid_completed_buttons : 0;
@@ -124,7 +167,8 @@ static void hid_note_completed_buttons(TickType_t now) {
     s_hid_completed_buttons_valid = true;
 }
 
-static uint32_t hid_held_release_mask(uint32_t current_buttons,
+static uint32_t hid_held_release_mask(hid_runtime_t *rt,
+                                      uint32_t current_buttons,
                                       uint32_t next_buttons,
                                       TickType_t now) {
     uint32_t releases = current_buttons & ~next_buttons;
@@ -148,6 +192,8 @@ static void hid_force_neutral(controller_handle_t *ctrl) {
         ctrl->buffer.front_buffer->report == NULL) {
         return;
     }
+    hid_runtime_t *rt = (hid_runtime_t *)ctrl->runtime;
+    if (rt == NULL) return;
     uint8_t counter = ((uint8_t *)ctrl->buffer.front_buffer->report)[0];
     ctrl->hid_ops->report_init(ctrl->buffer.front_buffer);
     ((uint8_t *)ctrl->buffer.front_buffer->report)[0] = counter;
@@ -157,26 +203,32 @@ static void hid_force_neutral(controller_handle_t *ctrl) {
     }
     s_hid_last_queued_size = 0;
     s_hid_last_queued_valid = false;
-    hid_reset_delivery_timing();
+    hid_reset_delivery_timing(rt);
     __atomic_store_n(&s_hid_report_dirty, true, __ATOMIC_RELEASE);
 }
 
-void controller_hid_notify_complete(uint16_t attr_handle, int status) {
-    if (attr_handle == g_hid_controller.ns2_notification_handle) {
+void controller_hid_notify_complete(uint16_t conn_handle, uint16_t attr_handle,
+                                    int status) {
+    controller_handle_t *ctrl = controller_hid_for_conn(conn_handle);
+    if (ctrl == NULL || ctrl->runtime == NULL) return;
+    hid_runtime_t *rt = (hid_runtime_t *)ctrl->runtime;
+    if (attr_handle == ctrl->ns2_notification_handle) {
         s_hid_notify_completions++;
         s_hid_delivery_stall_started_tick = 0;
         if (status != 0) {
             __atomic_store_n(&s_hid_report_dirty, true, __ATOMIC_RELEASE);
             runtime_status_note_hid_notify_failure();
         } else {
-            hid_note_completed_buttons(xTaskGetTickCount());
+            hid_note_completed_buttons(rt, xTaskGetTickCount());
         }
         s_hid_notify_buttons_valid = false;
         __atomic_store_n(&s_hid_notify_pending, false, __ATOMIC_RELEASE);
     }
 }
 
-void controller_hid_notify_reset(void) {
+void controller_hid_notify_reset(controller_handle_t *ctrl) {
+    if (ctrl == NULL || ctrl->runtime == NULL) return;
+    hid_runtime_t *rt = (hid_runtime_t *)ctrl->runtime;
     __atomic_store_n(&s_hid_notify_pending, false, __ATOMIC_RELEASE);
     __atomic_store_n(&s_hid_report_dirty, true, __ATOMIC_RELEASE);
     s_msys_free_ceiling = 0;
@@ -184,12 +236,18 @@ void controller_hid_notify_reset(void) {
     s_last_hid_send_tick = 0;
     s_hid_notify_started_tick = 0;
     s_hid_notify_free_before = 0;
-    hid_reset_delivery_timing();
+    hid_reset_delivery_timing(rt);
 }
 
 // HID report send task
 static void controller_task(void *arg) {
     controller_handle_t *ctrl = (controller_handle_t *)arg;
+    hid_runtime_t *rt = (hid_runtime_t *)ctrl->runtime;
+    if (rt == NULL) {
+        ctrl->task_handle = NULL;
+        vTaskDelete(NULL);
+        return;
+    }
     TickType_t xLastWakeTime = xTaskGetTickCount();
     const TickType_t xInterval = pdMS_TO_TICKS(HID_REPORT_INTERVAL);
 
@@ -197,17 +255,17 @@ static void controller_task(void *arg) {
 
     while (1) {
         // check if notification is enabled
-        g_subscribe_state_t *state = subscribe_entry_get(ctrl->ns2_notification_handle);
-        if (state == NULL || !state->notify_enabled ||
-            state->conn_handle == BLE_HS_CONN_HANDLE_NONE) {
+        if (!ctrl->notify_enabled ||
+            ctrl->conn_handle == BLE_HS_CONN_HANDLE_NONE) {
             ESP_LOGD(LOG_HID, "notification not enabled or no connection, skipping report send");
             xLastWakeTime = xTaskGetTickCount();
             vTaskDelay(pdMS_TO_TICKS(100));  // waiting for enable
             continue;
         }
 
-        if (g_device_status != DEV_READY) {
-            ESP_LOGD(LOG_HID, "device not ready, current status: %d", g_device_status);
+        if (device_status_get(ctrl->slot) != DEV_READY) {
+            ESP_LOGD(LOG_HID, "slot %u not ready, current status: %d",
+                     ctrl->slot, device_status_get(ctrl->slot));
             xLastWakeTime = xTaskGetTickCount();
             vTaskDelay(pdMS_TO_TICKS(100));  // waiting for device ready
             continue;
@@ -304,7 +362,7 @@ static void controller_task(void *arg) {
                     uint32_t next_buttons =
                         hid_report_buttons(snapshot.report, report_size);
                     uint32_t held_releases = hid_held_release_mask(
-                        current_buttons, next_buttons, now);
+                        rt, current_buttons, next_buttons, now);
 
                     if (held_releases != 0) {
                         // Apply new presses and analog values immediately, but
@@ -323,7 +381,7 @@ static void controller_task(void *arg) {
                         }
                     } else if (xQueueReceive(s_hid_state_queue, &snapshot, 0) ==
                                pdTRUE) {
-                        runtime_status_note_hid_dequeue(snapshot.report,
+                        runtime_status_note_hid_dequeue(ctrl->slot, snapshot.report,
                                                        report_size);
                         runtime_status_set_hid_queue_depth(
                             (uint32_t)uxQueueMessagesWaiting(
@@ -412,7 +470,7 @@ static void controller_task(void *arg) {
             // Mark clean before the call so a synchronous failure callback can
             // make it dirty again without being overwritten on return.
             __atomic_store_n(&s_hid_report_dirty, false, __ATOMIC_RELEASE);
-            int rc = gatt_notify(state->conn_handle, ctrl->ns2_notification_handle,
+            int rc = gatt_notify(ctrl->conn_handle, ctrl->ns2_notification_handle,
                                     report_buffer, report_size);
             if (rc != 0) {
                 s_hid_notify_buttons_valid = false;
@@ -423,7 +481,8 @@ static void controller_task(void *arg) {
                 ESP_LOGE(LOG_HID, "controller report send failed, rc: %d", rc);
                 xLastWakeTime = xTaskGetTickCount();
             } else {
-                runtime_status_note_ble_report(report_buffer, report_size);
+                runtime_status_note_ble_report(ctrl->slot, report_buffer,
+                                               report_size);
                 s_last_hid_send_tick = now;
             }
 
@@ -455,6 +514,14 @@ static int controller_init_impl(controller_handle_t *ctrl, controller_type_t typ
         return -1;
     }
     ctrl->type = type;
+
+    ctrl->runtime = calloc(1, sizeof(hid_runtime_t));
+    if (ctrl->runtime == NULL) {
+        ESP_LOGE(LOG_HID, "allocate HID runtime failed for slot %u", ctrl->slot);
+        return -1;
+    }
+    hid_runtime_t *rt = (hid_runtime_t *)ctrl->runtime;
+    s_hid_report_dirty = true;
 
     // Allocate double buffer memory
     ctrl->buffer.front_buffer = (controller_hid_report_t*)malloc(sizeof(controller_hid_report_t));
@@ -528,6 +595,15 @@ static void controller_deinit_impl(controller_handle_t *ctrl) {
 
     ctrl->buffer.swap_request = 0;
     ctrl->hid_ops = NULL;
+    if (ctrl->runtime != NULL) {
+        hid_runtime_t *rt = (hid_runtime_t *)ctrl->runtime;
+        if (s_hid_state_queue != NULL) {
+            vQueueDelete(s_hid_state_queue);
+            s_hid_state_queue = NULL;
+        }
+        free(ctrl->runtime);
+        ctrl->runtime = NULL;
+    }
 }
 
 static int controller_start_task_impl(controller_handle_t *ctrl) {
@@ -546,8 +622,10 @@ static int controller_start_task_impl(controller_handle_t *ctrl) {
         ESP_LOGE(LOG_HID, "controller not initialized");
         return -1;
     }
-    controller_hid_notify_reset();
-    BaseType_t rc = xTaskCreate(controller_task, "controller_task", 4096, ctrl, 4, &ctrl->task_handle);
+    controller_hid_notify_reset(ctrl);
+    char task_name[16];
+    snprintf(task_name, sizeof(task_name), "controller_%u", ctrl->slot);
+    BaseType_t rc = xTaskCreate(controller_task, task_name, 4096, ctrl, 4, &ctrl->task_handle);
     if (rc != pdPASS) {
         ESP_LOGE(LOG_HID, "create controller report task failed, rc: %d", rc);
         return -1;
@@ -564,7 +642,7 @@ static void controller_stop_task_impl(controller_handle_t *ctrl) {
         vTaskDelete(ctrl->task_handle);
         ctrl->task_handle = NULL;
     }
-    controller_hid_notify_reset();
+    controller_hid_notify_reset(ctrl);
 }
 
 static controller_hid_report_t* controller_get_back_buffer_impl(controller_handle_t *ctrl) {
@@ -575,9 +653,10 @@ static controller_hid_report_t* controller_get_back_buffer_impl(controller_handl
 }
 
 static void controller_hid_commit_impl(controller_handle_t *ctrl) {
-    if (ctrl == NULL) {
+    if (ctrl == NULL || ctrl->runtime == NULL) {
         return;
     }
+    hid_runtime_t *rt = (hid_runtime_t *)ctrl->runtime;
     __atomic_store_n(&s_hid_last_host_input_tick, xTaskGetTickCount(),
                      __ATOMIC_RELEASE);
     __atomic_store_n(&s_hid_host_input_seen, true, __ATOMIC_RELEASE);
@@ -596,14 +675,16 @@ static void controller_hid_commit_impl(controller_handle_t *ctrl) {
         }
         if (xQueueSend(s_hid_state_queue, &snapshot, 0) != pdTRUE) {
             s_hid_state_queue_drops++;
-            runtime_status_note_hid_enqueue(snapshot.report, report_size, true);
+            runtime_status_note_hid_enqueue(ctrl->slot, snapshot.report,
+                                            report_size, true);
             ESP_LOGW(LOG_HID, "HID state queue full, dropped=%lu",
                      (unsigned long)s_hid_state_queue_drops);
         } else {
             memcpy(&s_hid_last_queued_state, &snapshot, sizeof(snapshot));
             s_hid_last_queued_size = report_size;
             s_hid_last_queued_valid = true;
-            runtime_status_note_hid_enqueue(snapshot.report, report_size, false);
+            runtime_status_note_hid_enqueue(ctrl->slot, snapshot.report,
+                                            report_size, false);
             runtime_status_set_hid_queue_depth(
                 (uint32_t)uxQueueMessagesWaiting(s_hid_state_queue));
         }
@@ -614,9 +695,11 @@ static void controller_hid_commit_impl(controller_handle_t *ctrl) {
 }
 
 static void controller_hid_reset_impl(controller_handle_t *ctrl) {
-    if (ctrl == NULL || ctrl->hid_ops == NULL || ctrl->hid_ops->report_init == NULL) {
+    if (ctrl == NULL || ctrl->runtime == NULL || ctrl->hid_ops == NULL ||
+        ctrl->hid_ops->report_init == NULL) {
         return;
     }
+    hid_runtime_t *rt = (hid_runtime_t *)ctrl->runtime;
     // Device report_init reuses an existing payload. This resets the report
     // without allocating on every reconnect or changing pointers under the
     // serial parser task.
@@ -634,7 +717,7 @@ static void controller_hid_reset_impl(controller_handle_t *ctrl) {
     s_hid_last_queued_valid = false;
     __atomic_store_n(&s_hid_host_input_seen, false, __ATOMIC_RELEASE);
     __atomic_store_n(&s_hid_host_input_timed_out, false, __ATOMIC_RELEASE);
-    hid_reset_delivery_timing();
+    hid_reset_delivery_timing(rt);
 }
 
 const controller_ops_t controller_ops = {

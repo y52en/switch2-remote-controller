@@ -38,6 +38,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Native multi-controller unit tests
+        run: >-
+          cc -std=c11 -Wall -Wextra -Werror -pedantic
+          -Ifirmware/esp32-c3/main/include
+          firmware/esp32-c3/main/src/multi_controller.c
+          firmware/esp32-c3/test/native_multi_controller.c
+          -o /tmp/multi-controller-test && /tmp/multi-controller-test
       - uses: astral-sh/setup-uv@v6
         with:
           version: 0.9.18

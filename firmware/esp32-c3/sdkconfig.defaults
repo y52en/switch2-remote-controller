@@ -2,10 +2,19 @@
 CONFIG_BT_ENABLED=y
 CONFIG_BT_NIMBLE_ENABLED=y
 CONFIG_BT_NIMBLE_EXT_ADV=y
+CONFIG_BT_NIMBLE_MAX_CONNECTIONS=3
+CONFIG_BT_NIMBLE_MAX_BONDS=3
+# NimBLE always has advertising instance 0; two additional instances provide
+# the three independent legacy-format advertising identities used here.
+CONFIG_BT_NIMBLE_MAX_EXT_ADV_INSTANCES=2
+# Three active links plus up to three advertising procedures during pairing.
+CONFIG_BT_CTRL_BLE_MAX_ACT=6
+CONFIG_BT_NIMBLE_MAX_CCCDS=32
 CONFIG_BT_NIMBLE_LOG_LEVEL_WARNING=y
 CONFIG_ESP_CONSOLE_SECONDARY_NONE=y
 CONFIG_BT_NIMBLE_ROLE_CENTRAL=n
 CONFIG_BT_NIMBLE_TRANSPORT_ACL_FROM_LL_COUNT=30
+# Reserve enough notification mbufs for three concurrent HID pipelines.
 CONFIG_BT_NIMBLE_MSYS_1_BLOCK_COUNT=150
 CONFIG_BT_NIMBLE_MSYS_1_BLOCK_SIZE=128
 CONFIG_BT_NIMBLE_MSYS_2_BLOCK_COUNT=30

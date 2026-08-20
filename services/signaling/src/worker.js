@@ -1,10 +1,23 @@
+import {
+  assignGuest,
+  firstAvailableSlot,
+  guestForSlot,
+  normalizeAssignments,
+  releaseGuest,
+  releaseSlot,
+  slotForClaim,
+  slotForGuest,
+  validSlot,
+} from "./controller-assignments.js";
+
 const CODE_PATTERN = /^[A-HJ-NP-Z2-9]{10}$/;
 const ID_PATTERN = /^[0-9a-f]{16}$/;
 const SIGNAL_TYPES = new Set(["offer", "answer", "ice"]);
 const MAX_GUESTS = 16;
+const ASSIGNMENTS_KEY = "controllerAssignments";
 
 function validRumble(message) {
-  return message?.type === "rumble" &&
+  return message?.type === "rumble" && validSlot(message.slot) &&
     Number.isSafeInteger(message.seq) && message.seq >= 0 &&
     Number.isFinite(message.strong) && message.strong >= 0 && message.strong <= 1 &&
     Number.isFinite(message.weak) && message.weak >= 0 && message.weak <= 1 &&
@@ -28,6 +41,18 @@ export default {
 export class ControlRoom {
   constructor(state, env) { this.state = state; this.env = env; }
 
+  async assignments() {
+    return normalizeAssignments(await this.state.storage.get(ASSIGNMENTS_KEY));
+  }
+
+  async saveAssignments(assignments) {
+    const normalized = normalizeAssignments(assignments);
+    if (Object.keys(normalized).length) await this.state.storage.put(ASSIGNMENTS_KEY, normalized);
+    else await this.state.storage.delete(ASSIGNMENTS_KEY);
+    await this.state.storage.delete("activeGuestId");
+    return normalized;
+  }
+
   async fetch(request) {
     const url = new URL(request.url);
     if (url.pathname.includes("/api/ice/")) return this.issueIce(request);
@@ -47,34 +72,38 @@ export class ControlRoom {
       const name = (url.searchParams.get("name") || "ゲスト").trim().slice(0, 32);
       if (!ID_PATTERN.test(guestId) || !name) return new Response("invalid guest", { status: 400 });
       if (this.state.getWebSockets("host").length !== 1) return new Response("host unavailable", { status: 409 });
-      if (this.state.getWebSockets("guest").length >= MAX_GUESTS && !this.state.getWebSockets(`guest:${guestId}`).length) return new Response("room full", { status: 429 });
+      if (this.state.getWebSockets("guest").length >= MAX_GUESTS &&
+          !this.state.getWebSockets(`guest:${guestId}`).length) return new Response("room full", { status: 429 });
       for (const existing of this.state.getWebSockets(`guest:${guestId}`)) existing.close(4001, "reconnected");
       attachment = { role, guestId, name };
     }
+
     const pair = new WebSocketPair();
     const [client, server] = Object.values(pair);
     const tags = role === "host" ? ["host"] : ["guest", `guest:${attachment.guestId}`];
     this.state.acceptWebSocket(server, tags);
     server.serializeAttachment(attachment);
+
     if (role === "host") {
       for (const existing of this.state.getWebSockets("host")) if (existing !== server) existing.close(4001, "host replaced");
-      this.sendParticipants();
-      const activeGuestId = await this.state.storage.get("activeGuestId");
-      if (activeGuestId && this.state.getWebSockets(`guest:${activeGuestId}`).length) server.send(JSON.stringify({ type: "peer-ready", guestId: activeGuestId }));
+      const assignments = await this.assignments();
+      for (const [guestId, slot] of Object.entries(assignments)) {
+        if (this.state.getWebSockets(`guest:${guestId}`).length) this.sendPeerReady(guestId, slot);
+      }
+      await this.sendParticipants();
     } else {
-      this.sendParticipants();
-      const activeGuestId = await this.state.storage.get("activeGuestId");
-      if (!activeGuestId) {
-        await this.state.storage.put("activeGuestId", attachment.guestId);
-        this.broadcastControl(attachment.guestId);
-        this.sendTo("host", JSON.stringify({ type: "peer-ready", guestId: attachment.guestId }));
-        this.sendParticipants();
-      } else {
-        server.send(JSON.stringify({ type: "control", active: activeGuestId === attachment.guestId }));
-        if (activeGuestId === attachment.guestId) {
-          this.sendTo("host", JSON.stringify({ type: "peer-ready", guestId: attachment.guestId }));
+      let assignments = await this.assignments();
+      let slot = slotForGuest(assignments, attachment.guestId);
+      if (slot === null) {
+        slot = firstAvailableSlot(assignments);
+        if (slot !== null) {
+          assignments = assignGuest(assignments, attachment.guestId, slot).assignments;
+          await this.saveAssignments(assignments);
         }
       }
+      this.broadcastControl(assignments);
+      if (slot !== null) this.sendPeerReady(attachment.guestId, slot);
+      await this.sendParticipants();
     }
     return new Response(null, { status: 101, webSocket: client });
   }
@@ -107,102 +136,148 @@ export class ControlRoom {
     if (typeof raw !== "string" || raw.length > 32768) return socket.close(1009, "message too large");
     let message; try { message = JSON.parse(raw); } catch { return socket.close(1003, "invalid json"); }
     const { role, guestId } = socket.deserializeAttachment() || {};
+    let assignments = await this.assignments();
+
     if (role === "guest" && message.type === "claim") {
-      const previous = await this.state.storage.get("activeGuestId");
-      await this.state.storage.put("activeGuestId", guestId);
-      this.broadcastControl(guestId);
-      this.sendTo("host", JSON.stringify({ type: "control-released", guestId: previous || null }));
-      this.sendTo("host", JSON.stringify({ type: "peer-ready", guestId }));
-      this.sendParticipants();
+      const previousSlot = slotForGuest(assignments, guestId);
+      const requested = validSlot(message.slot) ? message.slot : null;
+      const slot = slotForClaim(assignments, guestId, requested);
+      if (slot === null) return;
+      assignments = assignGuest(assignments, guestId, slot).assignments;
+      await this.saveAssignments(assignments);
+      if (previousSlot !== null && previousSlot !== slot) this.sendControlReleased(guestId, previousSlot);
+      this.broadcastControl(assignments);
+      this.sendPeerReady(guestId, slot);
+      await this.sendParticipants();
       return;
     }
-    if (role === "guest" && message.type === "grant") {
-      if (!ID_PATTERN.test(message.guestId) || !this.state.getWebSockets(`guest:${message.guestId}`).length) return;
-      const previous = await this.state.storage.get("activeGuestId");
-      await this.state.storage.put("activeGuestId", message.guestId);
-      this.broadcastControl(message.guestId);
-      this.sendTo("host", JSON.stringify({ type: "control-released", guestId: previous || null }));
-      this.sendTo("host", JSON.stringify({ type: "peer-ready", guestId: message.guestId }));
-      this.sendParticipants();
+
+    if (role === "host" && message.type === "grant") {
+      if (!ID_PATTERN.test(message.guestId) || !validSlot(message.slot) ||
+          !this.state.getWebSockets(`guest:${message.guestId}`).length) return;
+      const previousSlot = slotForGuest(assignments, message.guestId);
+      const occupyingGuest = guestForSlot(assignments, message.slot);
+      const result = assignGuest(assignments, message.guestId, message.slot, { displace: true });
+      assignments = result.assignments;
+      await this.saveAssignments(assignments);
+      if (previousSlot !== null && previousSlot !== message.slot) this.sendControlReleased(message.guestId, previousSlot);
+      if (occupyingGuest && occupyingGuest !== message.guestId) this.sendControlReleased(occupyingGuest, message.slot);
+      this.broadcastControl(assignments);
+      this.sendPeerReady(message.guestId, message.slot);
+      await this.sendParticipants();
       return;
     }
-    if (role === "host" && message.type === "release") {
-      const previous = await this.state.storage.get("activeGuestId");
-      await this.state.storage.delete("activeGuestId");
-      this.broadcastControl(null);
-      this.sendTo("host", JSON.stringify({ type: "control-released", guestId: previous || null }));
-      this.sendParticipants();
+
+    if (role === "host" && message.type === "release" && validSlot(message.slot)) {
+      const released = releaseSlot(assignments, message.slot);
+      assignments = released.assignments;
+      await this.saveAssignments(assignments);
+      if (released.guestId) this.sendControlReleased(released.guestId, message.slot);
+      this.broadcastControl(assignments);
+      await this.sendParticipants();
       return;
     }
+
     if (role === "host" && message.type === "revoke") {
-      await this.state.storage.delete("activeGuestId");
+      await this.saveAssignments({});
       for (const guest of this.state.getWebSockets("guest")) guest.close(4002, "session ended by host");
       return;
     }
-    const activeGuestId = await this.state.storage.get("activeGuestId");
+
+    const assignedSlot = role === "guest" ? slotForGuest(assignments, guestId) : null;
     if (role === "guest" && message.type === "input") {
-      if (guestId !== activeGuestId) return;
-      if (raw.length > 2048 || !Number.isSafeInteger(message.seq) || message.seq < 0 || typeof message.state !== "object" || message.state === null) return socket.close(1008, "invalid input");
-      this.sendTo("host", raw);
+      if (assignedSlot === null) return;
+      if (raw.length > 2048 || !Number.isSafeInteger(message.seq) || message.seq < 0 ||
+          typeof message.state !== "object" || message.state === null) return socket.close(1008, "invalid input");
+      this.sendTo("host", JSON.stringify({ ...message, slot: assignedSlot, guestId }));
       return;
     }
+
     if (role === "host" && message.type === "input-ack") {
-      if (!activeGuestId || !Number.isSafeInteger(message.seq) || message.seq < 0) return;
-      this.sendToGuest(activeGuestId, message);
+      if (!validSlot(message.slot) || !Number.isSafeInteger(message.seq) || message.seq < 0) return;
+      const target = guestForSlot(assignments, message.slot);
+      if (target) this.sendToGuest(target, message);
       return;
     }
+
     if (role === "host" && message.type === "rumble") {
-      if (!activeGuestId || !validRumble(message)) return;
-      this.sendToGuest(activeGuestId, {
-        type: "rumble", seq: message.seq, strong: message.strong,
+      if (!validRumble(message)) return;
+      const target = guestForSlot(assignments, message.slot);
+      if (target) this.sendToGuest(target, {
+        type: "rumble", slot: message.slot, seq: message.seq, strong: message.strong,
         weak: message.weak, duration: message.duration,
       });
       return;
     }
+
     if (SIGNAL_TYPES.has(message.type)) {
-      const allowed = (role === "host" && ["offer", "ice"].includes(message.type)) || (role === "guest" && guestId === activeGuestId && ["answer", "ice"].includes(message.type));
-      if (!allowed || !activeGuestId) return;
-      if (role === "host") this.sendToGuest(activeGuestId, message); else this.sendTo("host", raw);
+      if (role === "host") {
+        if (!ID_PATTERN.test(message.guestId)) return;
+        const slot = slotForGuest(assignments, message.guestId);
+        if (slot === null || (validSlot(message.slot) && message.slot !== slot)) return;
+        this.sendToGuest(message.guestId, { ...message, guestId: message.guestId, slot });
+      } else if (assignedSlot !== null && ["answer", "ice"].includes(message.type)) {
+        this.sendTo("host", JSON.stringify({ ...message, guestId, slot: assignedSlot }));
+      }
     }
   }
 
   async webSocketClose(socket, code, reason) {
     const { role, guestId } = socket.deserializeAttachment() || {};
-    if (role === "host" && this.state.getWebSockets("host").length === 0) for (const guest of this.state.getWebSockets("guest")) guest.close(4003, "host disconnected");
-    if (role === "guest") {
-      const activeGuestId = await this.state.storage.get("activeGuestId");
-      if (guestId === activeGuestId && this.state.getWebSockets(`guest:${guestId}`).length === 0) {
-        await this.state.storage.delete("activeGuestId");
-        this.sendTo("host", JSON.stringify({ type: "control-released", guestId }));
-      }
-      this.sendParticipants();
+    if (role === "host" && this.state.getWebSockets("host").length === 0) {
+      for (const guest of this.state.getWebSockets("guest")) guest.close(4003, "host disconnected");
+    }
+    if (role === "guest" && this.state.getWebSockets(`guest:${guestId}`).length === 0) {
+      const released = releaseGuest(await this.assignments(), guestId);
+      await this.saveAssignments(released.assignments);
+      if (released.slot !== null) this.sendControlReleased(guestId, released.slot);
+      this.broadcastControl(released.assignments);
+      await this.sendParticipants();
     }
     try { socket.close(code, reason); } catch { }
   }
 
   participantList() {
-    return this.state.getWebSockets("guest").map((guest) => {
+    const unique = new Map();
+    for (const guest of this.state.getWebSockets("guest")) {
       const { guestId: id, name } = guest.deserializeAttachment();
-      return { id, name };
-    });
+      unique.set(id, { id, name });
+    }
+    return [...unique.values()];
   }
+
   async sendParticipants() {
-    const activeGuestId = await this.state.storage.get("activeGuestId");
-    const participants = this.participantList().map((guest) => ({ ...guest, active: guest.id === activeGuestId }));
+    const assignments = await this.assignments();
+    const participants = this.participantList().map((guest) => {
+      const slot = slotForGuest(assignments, guest.id);
+      return { ...guest, active: slot !== null, slot };
+    });
     const message = JSON.stringify({ type: "participants", participants });
     this.sendTo("host", message);
     this.sendTo("guest", message);
   }
-  broadcastControl(activeGuestId) {
+
+  broadcastControl(assignments) {
     for (const guest of this.state.getWebSockets("guest")) {
       const { guestId } = guest.deserializeAttachment();
-      try { guest.send(JSON.stringify({ type: "control", active: guestId === activeGuestId })); } catch { }
+      const slot = slotForGuest(assignments, guestId);
+      try { guest.send(JSON.stringify({ type: "control", active: slot !== null, slot })); } catch { }
     }
   }
+
+  sendPeerReady(guestId, slot) {
+    this.sendTo("host", JSON.stringify({ type: "peer-ready", guestId, slot }));
+  }
+
+  sendControlReleased(guestId, slot) {
+    this.sendTo("host", JSON.stringify({ type: "control-released", guestId, slot }));
+  }
+
   sendToGuest(guestId, message) {
     const raw = typeof message === "string" ? message : JSON.stringify(message);
     for (const socket of this.state.getWebSockets(`guest:${guestId}`)) try { socket.send(raw); } catch { }
   }
+
   sendTo(role, message) {
     for (const socket of this.state.getWebSockets(role)) try { socket.send(message); } catch { }
   }

@@ -7,15 +7,22 @@ import { WebSocketServer } from "ws";
 import { SerialPort } from "serialport";
 import dotenv from "dotenv";
 import { loadConfig } from "./config.mjs";
-import { NEUTRAL_STATE, sanitizeDigitalEdges, sanitizeState } from "./controller-state.mjs";
+import { sanitizeDigitalEdges, sanitizeState } from "./controller-state.mjs";
+import {
+  CONTROLLER_SLOT_COUNT,
+  createControllerStates,
+  sanitizeControllerSlot,
+} from "./controller-slots.mjs";
 import { encodeEasyConState } from "./easycon.mjs";
+import { initialEsp32ControllerStatus, parseEsp32ControllerStatus } from "./esp32-status.mjs";
+import { allowedLocalControlOrigin } from "./local-control-origin.mjs";
 import { makeRumbleMessage, parseEsp32RumbleLine } from "./rumble.mjs";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 dotenv.config({ path: path.join(here, ".env"), quiet: true });
 const config = loadConfig();
 
-let currentState = { ...NEUTRAL_STATE };
+let currentStates = createControllerStates();
 let lastBrowserInput = 0;
 let browserMessagesReceived = 0;
 let esp32SerialFramesWritten = 0;
@@ -28,8 +35,13 @@ let esp32DigitalEdgeFramesDropped = 0;
 let esp32BootCount = 0;
 let esp32LastReset = null;
 let esp32LogTail = "";
-let lastBrowserStateChange = 0;
-let esp32LastInputLatencyMs = null;
+let esp32UsesSlottedStatus = false;
+const lastBrowserStateChange = Array(CONTROLLER_SLOT_COUNT).fill(0);
+const esp32LastInputLatencyMsBySlot = Array(CONTROLLER_SLOT_COUNT).fill(null);
+const controllerStatus = Array.from(
+  { length: CONTROLLER_SLOT_COUNT },
+  (_, slot) => initialEsp32ControllerStatus(slot),
+);
 let esp32InputStateChanges = 0;
 let esp32BleConnIntervalUnits = null;
 let esp32BleConnects = 0;
@@ -60,11 +72,13 @@ let esp32BleNotifications = null;
 let esp32BleInputTransitions = null;
 let esp32RumbleFramesReceived = 0;
 let rumbleSequence = 1;
-let currentRumble = { type: "rumble", seq: 0, strong: 0, weak: 0, duration: 0 };
+const neutralRumble = (slot) => ({ type: "rumble", slot, seq: 0, strong: 0, weak: 0, duration: 0 });
+const currentRumbles = Array.from({ length: CONTROLLER_SLOT_COUNT }, (_, slot) => neutralRumble(slot));
 let localControllerSocket = null;
 let esp32Serial = null;
 let esp32SerialError = null;
-let pendingEsp32Frame = null;
+const pendingEsp32Frames = Array(CONTROLLER_SLOT_COUNT).fill(null);
+let nextPendingEsp32Slot = 0;
 const esp32EdgeFrames = [];
 const lastDigitalEdgeBySession = new Map();
 let esp32SerialWriteInFlight = false;
@@ -75,7 +89,7 @@ const ESP32_EDGE_QUEUE_LIMIT = 64;
 function publishRumble(raw) {
   const message = makeRumbleMessage(raw, rumbleSequence++);
   if (!message) return;
-  currentRumble = message;
+  currentRumbles[message.slot] = message;
   esp32RumbleFramesReceived += 1;
   const socket = localControllerSocket;
   if (socket?.readyState === 1) {
@@ -83,9 +97,10 @@ function publishRumble(raw) {
   }
 }
 
-function stopRumble() {
-  if (currentRumble.strong === 0 && currentRumble.weak === 0) return;
-  publishRumble({ firmwareSequence: 0, strongRaw: 0, weakRaw: 0 });
+function stopRumble(slot) {
+  const current = currentRumbles[slot];
+  if (current.strong === 0 && current.weak === 0) return;
+  publishRumble({ slot, firmwareSequence: 0, strongRaw: 0, weakRaw: 0 });
 }
 
 function sameState(left, right) {
@@ -95,11 +110,24 @@ function sameState(left, right) {
 
 function pumpEsp32Serial() {
   const serial = esp32Serial;
-  if (!serial?.isOpen || esp32SerialWriteInFlight || (!esp32EdgeFrames.length && !pendingEsp32Frame)) return;
+  if (!serial?.isOpen || esp32SerialWriteInFlight ||
+      (!esp32EdgeFrames.length && !pendingEsp32Frames.some(Boolean))) return;
 
   const isDigitalEdge = esp32EdgeFrames.length > 0;
-  const frame = isDigitalEdge ? esp32EdgeFrames.shift() : pendingEsp32Frame;
-  if (!esp32EdgeFrames.length && frame === pendingEsp32Frame) pendingEsp32Frame = null;
+  let frame;
+  if (isDigitalEdge) {
+    frame = esp32EdgeFrames.shift();
+  } else {
+    for (let offset = 0; offset < CONTROLLER_SLOT_COUNT; offset += 1) {
+      const slot = (nextPendingEsp32Slot + offset) % CONTROLLER_SLOT_COUNT;
+      if (!pendingEsp32Frames[slot]) continue;
+      frame = pendingEsp32Frames[slot];
+      pendingEsp32Frames[slot] = null;
+      nextPendingEsp32Slot = (slot + 1) % CONTROLLER_SLOT_COUNT;
+      break;
+    }
+  }
+  if (!frame) return;
   esp32SerialWriteInFlight = true;
   serial.write(frame, (writeError) => {
     if (writeError) {
@@ -117,14 +145,14 @@ function pumpEsp32Serial() {
   });
 }
 
-function queueEsp32State(state, countCoalesced = true) {
+function queueEsp32State(slot, state, countCoalesced = true) {
   if (!esp32Serial?.isOpen) return;
-  if (pendingEsp32Frame && countCoalesced) esp32SerialFramesCoalesced += 1;
-  pendingEsp32Frame = encodeEasyConState(state);
+  if (pendingEsp32Frames[slot] && countCoalesced) esp32SerialFramesCoalesced += 1;
+  pendingEsp32Frames[slot] = encodeEasyConState(state, slot);
   pumpEsp32Serial();
 }
 
-function queueEsp32Edges(states) {
+function queueEsp32Edges(slot, states) {
   if (!esp32Serial?.isOpen) return;
   for (let index = 0; index < states.length; index += 1) {
     const state = states[index];
@@ -133,7 +161,7 @@ function queueEsp32Edges(states) {
       esp32DigitalEdgeFramesDropped += states.length - index;
       break;
     }
-    esp32EdgeFrames.push(encodeEasyConState(state));
+    esp32EdgeFrames.push(encodeEasyConState(state, slot));
     esp32DigitalEdgeFramesQueued += 1;
   }
   pumpEsp32Serial();
@@ -164,7 +192,7 @@ function openEsp32Serial() {
     }
     esp32SerialError = null;
     console.log(`ESP32 BLE controller: ${config.esp32SerialPort}`);
-    queueEsp32State(currentState);
+    currentStates.forEach((state, slot) => queueEsp32State(slot, state));
   });
   serial.on("error", (error) => { esp32SerialError = error.message; });
   serial.on("data", (data) => {
@@ -181,14 +209,30 @@ function openEsp32Serial() {
         esp32BootCount += 1;
         esp32LastReset = reset[1].trim();
       }
-      if (line.trim() === "DI" && lastBrowserStateChange) {
-        esp32LastInputLatencyMs = Date.now() - lastBrowserStateChange;
-        lastBrowserStateChange = 0;
+      const inputAccepted = line.match(/^DI(?::([0-2]))?$/);
+      if (inputAccepted) {
+        const slot = Number(inputAccepted[1] ?? 0);
+        if (lastBrowserStateChange[slot]) {
+          const latency = Date.now() - lastBrowserStateChange[slot];
+          esp32LastInputLatencyMsBySlot[slot] = latency;
+          controllerStatus[slot].inputLatencyMs = latency;
+          lastBrowserStateChange[slot] = 0;
+        }
+        esp32InputStateChanges += 1;
       }
-      if (line.trim() === "DI") esp32InputStateChanges += 1;
-      if (line.includes("connected, set nintendo switch addr")) esp32BleConnects += 1;
+      const slotState = parseEsp32ControllerStatus(line, controllerStatus);
+      if (slotState) {
+        esp32UsesSlottedStatus = true;
+        controllerStatus[slotState.slot] = slotState.controller;
+        if (slotState.becameConnected) esp32BleConnects += 1;
+        if (slotState.becameDisconnected) esp32BleDisconnects += 1;
+        if (slotState.disconnectReason !== null) {
+          esp32BleLastDisconnectReason = slotState.disconnectReason;
+        }
+      }
+      if (!esp32UsesSlottedStatus && line.includes("connected, set nintendo switch addr")) esp32BleConnects += 1;
       const disconnect = line.match(/disconnected, reason=(\d+)/);
-      if (disconnect) {
+      if (disconnect && !esp32UsesSlottedStatus) {
         esp32BleDisconnects += 1;
         esp32BleLastDisconnectReason = Number(disconnect[1]);
       }
@@ -239,8 +283,14 @@ function openEsp32Serial() {
   });
   serial.on("close", () => {
     if (esp32Serial === serial) esp32Serial = null;
-    stopRumble();
-    pendingEsp32Frame = null;
+    esp32UsesSlottedStatus = false;
+    for (let slot = 0; slot < CONTROLLER_SLOT_COUNT; slot += 1) {
+      stopRumble(slot);
+      pendingEsp32Frames[slot] = null;
+      controllerStatus[slot] = {
+        ...controllerStatus[slot], state: "disconnected", connected: false, ready: false,
+      };
+    }
     esp32EdgeFrames.length = 0;
     esp32SerialWriteInFlight = false;
     setTimeout(openEsp32Serial, 2000).unref();
@@ -249,9 +299,9 @@ function openEsp32Serial() {
 
 openEsp32Serial();
 
-function sendState(state = currentState, sendSerial = true) {
+function sendState(slot, state = currentStates[slot], sendSerial = true) {
   if (sendSerial && esp32Serial?.isOpen) {
-    queueEsp32State(state);
+    queueEsp32State(slot, state);
   }
 }
 
@@ -259,7 +309,7 @@ function sendState(state = currentState, sendSerial = true) {
 setInterval(() => {
   if (localControllerSocket?.readyState === 1 && Date.now() - lastEsp32Keepalive >= 500) {
     lastEsp32Keepalive = Date.now();
-    queueEsp32State(currentState, false);
+    currentStates.forEach((state, slot) => queueEsp32State(slot, state, false));
   }
 }, 10).unref();
 
@@ -287,10 +337,10 @@ const server = http.createServer((request, response) => {
       esp32DigitalEdgeFramesQueued,
       esp32DigitalEdgeFramesWritten,
       esp32DigitalEdgeFramesDropped,
-      esp32SerialQueueBytes: esp32Serial ? esp32Serial.writableLength + (pendingEsp32Frame?.length ?? 0) + esp32EdgeFrames.length * 8 : null,
+      esp32SerialQueueBytes: esp32Serial ? esp32Serial.writableLength + pendingEsp32Frames.filter(Boolean).length * 8 + esp32EdgeFrames.length * 8 : null,
       esp32BootCount,
       esp32LastReset,
-      esp32LastInputLatencyMs,
+      esp32LastInputLatencyMs: esp32LastInputLatencyMsBySlot[0],
       esp32InputStateChanges,
       esp32BleConnIntervalUnits,
       esp32BleConnIntervalMs: esp32BleConnIntervalUnits == null ? null : esp32BleConnIntervalUnits * 1.25,
@@ -321,7 +371,14 @@ const server = http.createServer((request, response) => {
       esp32BleNotifications,
       esp32BleInputTransitions,
       esp32RumbleFramesReceived,
-      currentRumble,
+      currentRumble: currentRumbles[0],
+      controllerCount: CONTROLLER_SLOT_COUNT,
+      controllers: controllerStatus.map((controller, slot) => ({
+        ...controller,
+        connectionIntervalMs: controller.connectionIntervalUnits == null
+          ? null : controller.connectionIntervalUnits * 1.25,
+        currentRumble: currentRumbles[slot],
+      })),
     }));
     return;
   }
@@ -348,6 +405,10 @@ websocket.on("connection", (socket, request) => {
     socket.close(1008, "local clients only");
     return;
   }
+  if (!allowedLocalControlOrigin(request.headers.origin, config.httpPort)) {
+    socket.close(1008, "invalid local origin");
+    return;
+  }
   // Keep the first tab stable. Reconnecting background tabs are rejected and
   // cannot create an ownership loop. A user gesture can explicitly take over.
   const takeover = new URL(request.url, "http://localhost").searchParams.get("takeover") === "1";
@@ -362,32 +423,39 @@ websocket.on("connection", (socket, request) => {
   } else {
     localControllerSocket = socket;
   }
-  if (socket.readyState === 1) socket.send(JSON.stringify(currentRumble));
+  if (socket.readyState === 1) {
+    for (const rumble of currentRumbles) socket.send(JSON.stringify(rumble));
+  }
   socket.bridgeAlive = true;
   socket.on("pong", () => { socket.bridgeAlive = true; });
   socket.on("message", (raw) => {
     try {
       const message = JSON.parse(raw.toString());
       if (message.type !== "input") return;
+      const slot = sanitizeControllerSlot(message.slot);
+      if (slot === null) {
+        socket.close(1008, "invalid controller slot");
+        return;
+      }
       const nextState = sanitizeState(message.state);
-      const stateChanged = JSON.stringify(nextState) !== JSON.stringify(currentState);
+      const stateChanged = JSON.stringify(nextState) !== JSON.stringify(currentStates[slot]);
       if (stateChanged) {
-        lastBrowserStateChange = Date.now();
+        lastBrowserStateChange[slot] = Date.now();
       }
       const digital = acceptDigitalEdges(message);
       if (digital.states.length) {
         browserDigitalEdgesAccepted += digital.states.length;
-        lastBrowserStateChange = Date.now();
-        queueEsp32Edges(digital.states);
+        lastBrowserStateChange[slot] = Date.now();
+        queueEsp32Edges(slot, digital.states);
       }
-      currentState = nextState;
+      currentStates[slot] = nextState;
       lastBrowserInput = Date.now();
       browserMessagesReceived += 1;
       const finalEdgeState = digital.states.at(-1);
-      const finalStateAlreadyQueued = finalEdgeState && sameState(finalEdgeState, currentState);
+      const finalStateAlreadyQueued = finalEdgeState && sameState(finalEdgeState, currentStates[slot]);
       // Analog states remain latest-value-wins. Digital transitions are queued
       // separately above, so a release can never overwrite an unsent press.
-      sendState(currentState, stateChanged && !finalStateAlreadyQueued);
+      sendState(slot, currentStates[slot], stateChanged && !finalStateAlreadyQueued);
       if (digital.sid && digital.edgeAck !== null && socket.readyState === 1) {
         socket.send(JSON.stringify({ type: "edge-ack", sid: digital.sid, edgeAck: digital.edgeAck }));
       }
@@ -398,9 +466,9 @@ websocket.on("connection", (socket, request) => {
   socket.on("close", () => {
     if (socket !== localControllerSocket) return;
     localControllerSocket = null;
-    currentState = { ...NEUTRAL_STATE };
+    currentStates = createControllerStates();
     lastBrowserInput = 0;
-    sendState();
+    currentStates.forEach((state, slot) => sendState(slot, state));
   });
 });
 
@@ -421,8 +489,8 @@ server.listen(config.httpPort, "127.0.0.1", () => {
 });
 
 function shutdown() {
-  currentState = { ...NEUTRAL_STATE };
-  sendState();
+  currentStates = createControllerStates();
+  currentStates.forEach((state, slot) => sendState(slot, state));
   setTimeout(() => process.exit(0), 30);
 }
 process.on("SIGINT", shutdown);

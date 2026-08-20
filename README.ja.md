@@ -4,7 +4,8 @@
 
 ESP32-C3を使った実験的なリモートコントローラーです。ブラウザの入力を
 ローカルのNode.jsブリッジへ送り、USB Serial/JTAG経由でESP32-C3へ転送し、
-ESP32-C3がBluetooth LEコントローラーとしてNintendo Switch 2へ接続します。
+ESP32-C3が3つの独立したBluetooth LEコントローラーとしてNintendo Switch 2へ
+接続します。
 
 > Nintendoとは無関係の非公式コミュニティプロジェクトです。システム更新に
 > よってコントローラー互換性が変わる可能性があります。
@@ -22,7 +23,7 @@ ESP32-C3がBluetooth LEコントローラーとしてNintendo Switch 2へ接続�
                                                v
                                             ESP32-C3
                                                |
-                                               | Bluetooth LE
+                                               | 3つのBLE ID / 接続
                                                v
                                       Nintendo Switch 2
 
@@ -91,18 +92,26 @@ npm run start:host
 シリアル再接続、デジタル入力エッジの保持、ページ切断時のニュートラル送信を
 行います。
 
+3枚のコントローラーカードで、ローカル入力の送り先と各BLE接続の状態を個別に
+確認できます。リモート参加者へ割り当てたカードはローカル側でロックされるため、
+同じ仮想コントローラーを2人が同時操作することはありません。
+
 ## ペアリング
 
 1. いずれかのプロファイルを書き込み、データ通信対応USBケーブルでESP32-C3を
    接続し直します。
 2. ホストアプリを起動し、ローカルURLを開きます。
 3. Switch 2でコントローラーのペアリング画面を開きます。
-4. エミュレートされたコントローラーが表示されるまで、画面上または割り当て済みの
-   **L**と**R**を押し、Switch 2側で登録を完了します。
-5. リモート用URLを発行する前に、ローカルでボタンとスティックを確認します。
+4. ブラウザで**コントローラー1**を選択し、画面上または割り当て済みの**L**と
+   **R**を押してSwitch 2側で登録を完了します。
+5. **コントローラー2**と**コントローラー3**でも繰り返します。各カードの状態は
+   ペアリング中から接続済み／準備完了へ個別に変化します。
+6. リモート用URLを発行する前に、全スロットのボタンとスティックを確認します。
 
-ペアリング情報はESP32のフラッシュへ保存されます。シリアルケーブルを抜く前に
-ホストページを閉じ、ニュートラル復帰処理が動作する状態にしてください。
+3つのBLE IDはそれぞれ異なるアドレスを使い、NimBLEの相手アドレス単位のボンド
+ストアに合わせて1つの永続LTKを共有します。ペアリング情報はESP32のフラッシュへ
+保存されます。シリアルケーブルを抜く前にホストページを閉じ、ニュートラル復帰
+処理が動作する状態にしてください。
 
 ## リモート接続
 
@@ -122,7 +131,10 @@ npm run deploy
 デプロイ手順は[services/signaling/README.md](services/signaling/README.md)を参照して
 ください。TURN認証情報はコミットせず、Wrangler secretsへ登録します。Workerは
 静的assets、`ROOMS`というDurable Object binding、任意の`TURN_KEY_ID` /
-`TURN_KEY_API_TOKEN` secretsを使用します。デプロイ後も操作入力はP2Pで流れます。
+`TURN_KEY_API_TOKEN` secretsを使用します。操作入力はWebRTC DataChannelを優先し、
+P2Pが利用できない場合またはリレー固定モードではルーム経由へ切り替わります。
+最初の3人には空いているコントローラースロットが自動割り当てされ、4人目以降は
+ロビーで待機します。ホストは参加者一覧からスロットを個別に解放・再割り当てできます。
 
 ## トラブルシューティング
 
@@ -146,6 +158,10 @@ npm run deploy
 ```sh
 npm test
 npm run check:signaling
+cc -std=c11 -Wall -Wextra -Werror -pedantic -Ifirmware/esp32-c3/main/include \
+  firmware/esp32-c3/main/src/multi_controller.c \
+  firmware/esp32-c3/test/native_multi_controller.c \
+  -o /tmp/multi-controller-test && /tmp/multi-controller-test
 uv run --frozen python scripts/check_public_tree.py
 ```
 
@@ -157,6 +173,9 @@ CIでは3 OSのホストテストと、Linux上で両ファームウェアをビ
 - ファームウェアはホスト入力が1.2秒途絶えるとキューを破棄してニュートラルへ戻します。
 - ホストは操作ページ切断時にニュートラル状態を送ります。
 - BLEキュー停止や通知失敗には時間制限付きの復旧処理があります。
+- 3接続はESP32-C3の無線とメモリプールを共有します。コンソールやESP-IDFの更新後は
+  必ず3台を同時に実機検証してください。1接続の成功だけでは3接続時のタイミング安定性を
+  保証できません。
 - 非標準の5 ms BLE間隔を利用するため、ESP32-C3対応は実験的です。
 
 README用メディアは`docs/assets`へ置き、未圧縮動画はGitへコミットしません。

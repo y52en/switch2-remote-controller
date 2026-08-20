@@ -10,6 +10,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "runtime_status.h"
+#include "device.h"
 
 #define LCD_HOST SPI2_HOST
 #define LCD_RST ((gpio_num_t)CONFIG_REMOTE_LCD_RST_PIN)
@@ -302,8 +303,9 @@ static void update_dashboard(void) {
                            rx < 124 || rx > 132 || ry < 124 || ry > 132;
 
     set_line(0, "SWITCH 2", CYAN, 2);
-    if (status.device_status == 2) set_line(1, "BLE READY", GREEN, 2);
-    else if (status.device_status == 1) set_line(1, "BLE PAIR", YELLOW, 2);
+    if (status.device_status == DEV_READY) set_line(1, "BLE READY", GREEN, 2);
+    else if (status.device_status == DEV_ADV_IND ||
+             status.device_status == DEV_CONNECTED) set_line(1, "BLE PAIR", YELLOW, 2);
     else set_line(1, "BLE BOOT", RED, 2);
 
     uint16_t interval = status.ble_interval_units;

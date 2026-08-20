@@ -11,7 +11,7 @@ extern "C" {
 #define RUMBLE_FEEDBACK_MAX_PACKET_SIZE 64
 
 int rumble_feedback_init(void);
-void rumble_feedback_note_packet(const uint8_t *packet, size_t length);
+void rumble_feedback_note_packet(uint8_t slot, const uint8_t *packet, size_t length);
 
 #ifdef __cplusplus
 }

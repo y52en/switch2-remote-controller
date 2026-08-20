@@ -6,6 +6,7 @@
 #include "device.h"
 #include "utils.h"
 #include "runtime_status.h"
+#include "multi_controller.h"
 
 #include <stdint.h>
 #include <stdbool.h>
@@ -83,14 +84,25 @@ static parse_result_t easycon_hid_parse_frame(void *state,
     uint8_t rx_raw       = raw[5];
     uint8_t ry_raw       = raw[6];
 
-    uint16_t button_mask = ((uint16_t)button_byte0 << 8) | button_byte1;
+    uint16_t slotted_buttons = ((uint16_t)button_byte0 << 8) | button_byte1;
+    uint8_t controller_slot;
+    uint16_t button_mask;
+    if (!multi_controller_decode_buttons(slotted_buttons, &controller_slot,
+                                         &button_mask)) {
+        ESP_LOGW(LOG_PROTOCOL, "invalid controller slot %u",
+                 (uint8_t)(slotted_buttons >> 14));
+        rsp->len = 0;
+        return PARSE_INVALID;
+    }
     uint16_t left_stick_x  = ec_scale_stick_value(lx_raw);
     uint16_t left_stick_y  = ec_scale_stick_value(255 - ly_raw);
     uint16_t right_stick_x = ec_scale_stick_value(rx_raw);
     uint16_t right_stick_y = ec_scale_stick_value(255 - ry_raw);
 
-    const controller_hid_ops_t *ops = g_hid_controller.hid_ops;
-    controller_hid_report_t *back_buffer = g_hid_controller.ops->get_back_buffer(&g_hid_controller);
+    controller_handle_t *controller = controller_hid_for_slot(controller_slot);
+    const controller_hid_ops_t *ops = controller != NULL ? controller->hid_ops : NULL;
+    controller_hid_report_t *back_buffer = controller != NULL
+        ? controller->ops->get_back_buffer(controller) : NULL;
     if (ops && back_buffer) {
         for (size_t i = 0; i < BUTTON_MAP_SIZE; i++) {
             btns_pro2 btn = button_map[i];
@@ -126,8 +138,8 @@ static parse_result_t easycon_hid_parse_frame(void *state,
         ops->set_left_stick(back_buffer, left_stick_x, left_stick_y);
         ops->set_right_stick(back_buffer, right_stick_x, right_stick_y);
 
-        g_hid_controller.ops->hid_commit(&g_hid_controller);
-        runtime_status_note_input_state(button_mask, hat_state,
+        controller->ops->hid_commit(controller);
+        runtime_status_note_input_state(controller_slot, button_mask, hat_state,
                                         lx_raw, ly_raw, rx_raw, ry_raw);
     }
 

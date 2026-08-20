@@ -2,7 +2,7 @@
 <html lang="ja">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Switch 2 Remote Controller</title>
   <link rel="stylesheet" href="/style.css">
   <link rel="stylesheet" href="/keymap.css">
@@ -19,17 +19,33 @@
       <span id="top-control-state">ロビーへ接続中</span>
     </section>
 
-    <section id="device-diagnostics" class="device-diagnostics" aria-label="接続ステータス">
-      <span><b>ブラウザ</b><strong id="diag-browser">確認中</strong></span>
-      <span><b>ESP32</b><strong id="diag-serial">確認中</strong></span>
-      <span><b>送信</b><strong id="diag-frames">—</strong></span>
-      <span><b>キュー</b><strong id="diag-queue">—</strong></span>
-      <span><b>PC→ESP32</b><strong id="diag-input-latency">—</strong></span>
-      <span><b>BLE間隔</b><strong id="diag-ble-interval">—</strong></span>
-      <span><b>BLE空き</b><strong id="diag-ble-queue">—</strong></span>
-    </section>
+    <details id="device-diagnostics" class="device-diagnostics">
+      <summary>接続の詳細診断</summary>
+      <div class="diagnostic-grid" aria-label="接続ステータス">
+        <span><b>ブラウザ</b><strong id="diag-browser">確認中</strong></span>
+        <span><b>ESP32</b><strong id="diag-serial">確認中</strong></span>
+        <span><b>送信</b><strong id="diag-frames">—</strong></span>
+        <span><b>キュー</b><strong id="diag-queue">—</strong></span>
+        <span><b>PC→ESP32</b><strong id="diag-input-latency">—</strong></span>
+        <span><b>BLE間隔</b><strong id="diag-ble-interval">—</strong></span>
+        <span><b>BLE空き</b><strong id="diag-ble-queue">—</strong></span>
+      </div>
+    </details>
 
-    <section class="controller controller-v2" aria-label="controller">
+    <section id="controller-slots" class="controller-slots" aria-label="コントローラー選択">
+      <button class="slot-card" type="button" data-controller-slot="0" aria-pressed="true">
+        <span class="slot-number">1</span><span class="slot-copy"><b>コントローラー 1</b><strong class="slot-state">確認中</strong><small class="slot-owner">ローカル操作可</small></span>
+      </button>
+      <button class="slot-card" type="button" data-controller-slot="1" aria-pressed="false">
+        <span class="slot-number">2</span><span class="slot-copy"><b>コントローラー 2</b><strong class="slot-state">確認中</strong><small class="slot-owner">ローカル操作可</small></span>
+      </button>
+      <button class="slot-card" type="button" data-controller-slot="2" aria-pressed="false">
+        <span class="slot-number">3</span><span class="slot-copy"><b>コントローラー 3</b><strong class="slot-state">確認中</strong><small class="slot-owner">ローカル操作可</small></span>
+      </button>
+    </section>
+    <p id="controller-target" class="controller-target" role="status">コントローラー 1をローカル操作しています</p>
+
+    <section class="controller controller-v2" aria-label="仮想コントローラー">
       <div class="shoulder-row control-row">
         <button data-button="4">L</button><button data-button="6">ZL</button>
         <button data-button="7">ZR</button><button data-button="5">R</button>
@@ -59,20 +75,6 @@
       <div class="stick-click-row control-row">
         <button data-button="10">左スティック押し込み</button><button data-button="11">右スティック押し込み</button>
       </div>
-    </section>
-
-    <section class="controller" aria-label="controller">
-      <div class="cluster dpad" aria-label="direction pad">
-        <button data-hat="0" class="up">▲</button><button data-hat="6" class="left">◀</button>
-        <button data-hat="2" class="right">▶</button><button data-hat="4" class="down">▼</button>
-      </div>
-      <div class="center-buttons"><button data-button="8">−</button><button data-button="12" class="home">⌂</button><button data-button="9">＋</button></div>
-      <div class="cluster face" aria-label="face buttons">
-        <button data-button="3" class="x">X</button><button data-button="0" class="y">Y</button>
-        <button data-button="2" class="a">A</button><button data-button="1" class="b">B</button>
-      </div>
-      <div class="shoulders left-shoulders"><button data-button="4">L</button><button data-button="6">ZL</button></div>
-      <div class="shoulders right-shoulders"><button data-button="5">R</button><button data-button="7">ZR</button></div>
     </section>
 
     <section class="info">
@@ -116,6 +118,7 @@
 
     <section id="session-panel" class="session-panel">
       <h2>Web遠隔操作</h2>
+      <p class="panel-lead">参加者を3台のコントローラーへ個別に割り当て、同時に操作できます。</p>
       <label>Cloudflare Worker URL <input id="signal-base" type="url" placeholder="https://switch2-remote.example.workers.dev"></label>
       <label>通信方式
         <select id="transport-mode">
@@ -125,7 +128,7 @@
       </label>
       <div class="session-actions">
         <button id="new-session">セッション発行</button>
-        <button id="release-control" disabled>操作権を回収</button>
+        <button id="release-control" disabled>選択中の割り当てを解除</button>
         <button id="revoke-session" disabled>セッション終了</button>
       </div>
       <p id="session-code"></p>

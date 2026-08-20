@@ -280,6 +280,11 @@ static int gatt_svc_write_no_rsp_access(uint16_t conn_handle, uint16_t attr_hand
   struct ble_gatt_access_ctxt* ctxt, void* arg) {
   uint8_t opcode = ctxt->op;
   int rc;
+  int controller_slot = device_slot_from_conn(conn_handle);
+  if (controller_slot < 0) {
+    ESP_LOGE(LOG_APP, "GATT write for unknown connection %u", conn_handle);
+    return BLE_ATT_ERR_UNLIKELY;
+  }
   ESP_LOGD(LOG_APP, "Write no rsp access callback, handle=0x00%02x, opcode=0x00%02x, mtu=%d",
     attr_handle, opcode, ble_att_mtu(conn_handle));
   if (ctxt->op == BLE_GATT_ACCESS_OP_WRITE_CHR) {
@@ -319,7 +324,7 @@ static int gatt_svc_write_no_rsp_access(uint16_t conn_handle, uint16_t attr_hand
         data_buf[0], data_buf[1], data_buf[2], data_buf[3], data_buf[4], data_buf[5], data_buf[6], data_buf[7]);
       rsp->cmd = data_buf[0];
       rsp->subcmd = data_buf[3];
-      rc = cmd_process(rsp, data_buf, data_len);
+      rc = cmd_process(rsp, data_buf, data_len, (uint8_t)controller_slot);
       if (rc != 0) {
         ESP_LOGE(LOG_APP, "commands process failed: 0x%02x", rc);
       } else {
@@ -342,7 +347,7 @@ static int gatt_svc_write_no_rsp_access(uint16_t conn_handle, uint16_t attr_hand
         ? data_len : RUMBLE_FEEDBACK_MAX_PACKET_SIZE;
       uint8_t packet[RUMBLE_FEEDBACK_MAX_PACKET_SIZE];
       if (copy_len > 0 && os_mbuf_copydata(ctxt->om, 0, copy_len, packet) == 0) {
-        rumble_feedback_note_packet(packet, copy_len);
+        rumble_feedback_note_packet((uint8_t)controller_slot, packet, copy_len);
       }
 
       return 0;

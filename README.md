@@ -4,8 +4,8 @@
 
 An experimental remote controller built around an ESP32-C3. A browser sends
 controller state to a local Node.js bridge, the bridge writes compact EasyCon
-frames over USB Serial/JTAG, and the ESP32-C3 presents the controller to a
-Nintendo Switch 2 over Bluetooth LE.
+frames over USB Serial/JTAG, and one ESP32-C3 presents three independent
+controller identities to a Nintendo Switch 2 over Bluetooth LE.
 
 > This is an unofficial community project and is not affiliated with or
 > endorsed by Nintendo. Console updates may change controller compatibility.
@@ -23,7 +23,7 @@ remote browser -- WebRTC DataChannel --> host browser
                                           v
                                        ESP32-C3
                                           |
-                                          | Bluetooth LE
+                                          | 3 BLE identities / links
                                           v
                                     Nintendo Switch 2
 
@@ -93,19 +93,26 @@ Open `http://127.0.0.1:8787`. The bridge accepts local WebSocket clients only,
 reconnects the configured serial port, preserves digital button edges, and
 sends neutral input when the controller page disconnects.
 
+The three controller cards select the local input destination and show each
+BLE link independently. A remotely assigned card is locked locally so two
+input sources cannot fight over the same virtual controller.
+
 ## Pairing
 
 1. Flash either firmware profile and reconnect the ESP32-C3 with a USB data
    cable.
 2. Start the host application and open its local URL.
 3. Open the controller pairing screen on the Switch 2.
-4. Press the on-screen or mapped **L** and **R** controls until the emulated
-   controller appears, then complete pairing on the console.
-5. Confirm buttons and sticks locally before creating a remote guest link.
+4. Select **Controller 1** in the browser, press the on-screen or mapped **L**
+   and **R** controls, and complete pairing on the console.
+5. Repeat for **Controller 2** and **Controller 3**. The status cards change
+   independently from pairing to connected/ready.
+6. Confirm buttons and sticks on every slot before creating a remote guest link.
 
-Pairing data is saved in ESP32 flash. Keep the board powered and close the host
-page before disconnecting the serial cable so the neutral-state safety path can
-run.
+The three BLE identities use distinct addresses and one shared persisted LTK,
+which matches NimBLE's peer-keyed bond store. Pairing data is saved in ESP32
+flash. Keep the board powered and close the host page before disconnecting the
+serial cable so the neutral-state safety path can run.
 
 ## Remote access
 
@@ -126,7 +133,11 @@ For deployment, see [services/signaling/README.md](services/signaling/README.md)
 TURN credentials must be stored with Wrangler secrets rather than committed to
 the repository. The Worker configuration provides static assets, one Durable
 Object binding named `ROOMS`, and optional `TURN_KEY_ID` / `TURN_KEY_API_TOKEN`
-secrets. Controller input remains peer-to-peer even when signaling is deployed.
+secrets. Controller input prefers a direct WebRTC DataChannel and falls back to
+the room relay when P2P is unavailable or relay mode is selected.
+The first three guests are assigned to the first three free controller slots;
+additional guests wait in the lobby. The host can release or reassign each slot
+independently from the participant list.
 
 ## Troubleshooting
 
@@ -150,6 +161,10 @@ secrets. Controller input remains peer-to-peer even when signaling is deployed.
 ```sh
 npm test
 npm run check:signaling
+cc -std=c11 -Wall -Wextra -Werror -pedantic -Ifirmware/esp32-c3/main/include \
+  firmware/esp32-c3/main/src/multi_controller.c \
+  firmware/esp32-c3/test/native_multi_controller.c \
+  -o /tmp/multi-controller-test && /tmp/multi-controller-test
 uv run --frozen python scripts/check_public_tree.py
 ```
 
@@ -162,6 +177,9 @@ still be checked on a physical console before publishing a release binary.
 - Firmware clears queued input after 1.2 seconds without a fresh host frame.
 - The host sends neutral state when its active controller page disconnects.
 - BLE queue stalls and failed notifications have bounded recovery paths.
+- Three simultaneous links share the ESP32-C3 radio and memory pool. Validate
+  all three together after console or ESP-IDF updates; one-link success does not
+  establish three-link timing stability.
 - ESP32-C3 support uses a non-standard 5 ms BLE interval and remains experimental.
 
 Media intended for the README belongs in `docs/assets`; keep raw video outside

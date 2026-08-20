@@ -88,7 +88,8 @@ int cmd_system_init();
  * @param payload_len received data length
  * @return int 0->success, -1->failed
  */
-int cmd_process(pro2_gatt_rsp_t* rsp, uint8_t* data_in, uint16_t payload_len);
+int cmd_process(pro2_gatt_rsp_t* rsp, uint8_t* data_in, uint16_t payload_len,
+                uint8_t controller_slot);
 
 /** @} */
 

@@ -34,13 +34,26 @@
 typedef enum DEVICE_STATUS {
     DEV_BOOT,           // esp device boot
     DEV_ADV_IND,        // ble adv started
+    DEV_CONNECTED,      // link established, HID setup in progress
     DEV_READY,          // ble paired, ready for hid
+    DEV_DISCONNECTED,
 } device_status_t;
 
-extern device_status_t g_device_status;
+typedef struct {
+  device_status_t status;
+  uint16_t conn_handle;
+  uint16_t conn_interval;
+} device_slot_state_t;
+
+extern device_slot_state_t g_device_slots[CONTROLLER_SLOT_COUNT];
 
 // Set device status
-void device_status_set(device_status_t status);
+void device_status_set(uint8_t slot, device_status_t status);
+void device_slot_update(uint8_t slot, device_status_t status,
+    uint16_t conn_handle, uint16_t conn_interval, int disconnect_reason);
+device_status_t device_status_get(uint8_t slot);
+int device_slot_from_conn(uint16_t conn_handle);
+void device_status_publish_all(void);
 
 // **************** BLE Stack ****************
 
@@ -65,7 +78,8 @@ void ble_gatts_bonding_established(uint16_t conn_handle);
 extern uint8_t g_adv_opcode;
 
 // adv
-void ble_advertise();
+void ble_advertise(uint8_t slot);
+void ble_advertise_all(void);
 
 // **************** BLE Subscription ****************
 

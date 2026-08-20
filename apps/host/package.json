@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "start": "node server.mjs",
-    "test": "node --test controller-state.test.mjs config.test.mjs easycon.test.mjs input-reliability.test.mjs keymap.test.mjs gamepad-map.test.mjs transport.test.mjs rumble.test.mjs haptics.test.mjs",
+    "test": "node --test controller-state.test.mjs controller-slots.test.mjs controller-assignments.test.mjs config.test.mjs easycon.test.mjs esp32-status.test.mjs input-reliability.test.mjs keymap.test.mjs gamepad-map.test.mjs local-control-origin.test.mjs transport.test.mjs rumble.test.mjs haptics.test.mjs public/controller-slots.test.mjs public/webrtc-ice.test.mjs public-ui.test.mjs",
     "test:cloudflare": "node cloudflare-signaling.test.mjs"
   },
   "dependencies": {

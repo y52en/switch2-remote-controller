@@ -3,13 +3,25 @@
 #include "controller/hid_controller.h"
 #include "utils.h"
 
+#include <stdint.h>
+
 #include "freertos/FreeRTOS.h"
 #include "freertos/timers.h"
 
-static TimerHandle_t s_restart_adv_timer = NULL;
+static TimerHandle_t s_restart_adv_timers[CONTROLLER_SLOT_COUNT];
 
-static void restart_adv_timer_cb(TimerHandle_t xTimer) {
-  ble_advertise();
+static void restart_adv_timer_cb(TimerHandle_t timer) {
+  uint8_t slot = (uint8_t)(uintptr_t)pvTimerGetTimerID(timer);
+  ble_advertise(slot);
+}
+
+static uint8_t event_slot(void *arg, uint16_t conn_handle) {
+  if (conn_handle != BLE_HS_CONN_HANDLE_NONE) {
+    int mapped = device_slot_from_conn(conn_handle);
+    if (mapped >= 0) return (uint8_t)mapped;
+  }
+  uint8_t advertised = (uint8_t)(uintptr_t)arg;
+  return advertised < CONTROLLER_SLOT_COUNT ? advertised : 0;
 }
 
 static void print_conn_desc(struct ble_gap_conn_desc* desc) {
@@ -34,138 +46,153 @@ static void print_conn_desc(struct ble_gap_conn_desc* desc) {
     desc->sec_state.bonded);
 }
 
+static void schedule_advertising_restart(uint8_t slot) {
+  if (slot >= CONTROLLER_SLOT_COUNT) return;
+  if (s_restart_adv_timers[slot] == NULL) {
+    s_restart_adv_timers[slot] = xTimerCreate(
+      "restart_adv", pdMS_TO_TICKS(3000), pdFALSE,
+      (void *)(uintptr_t)slot, restart_adv_timer_cb);
+  }
+  if (s_restart_adv_timers[slot] != NULL) {
+    xTimerReset(s_restart_adv_timers[slot], 0);
+  }
+}
+
 int handle_gap_event(struct ble_gap_event* event, void* arg) {
   struct ble_gap_conn_desc desc;
   int rc;
 
   switch(event->type) {
-    case BLE_GAP_EVENT_CONNECT:
+    case BLE_GAP_EVENT_CONNECT: {
+      uint8_t slot = event_slot(arg, event->connect.conn_handle);
       if (event->connect.status == 0) {
         rc = ble_gap_conn_find(event->connect.conn_handle, &desc);
         assert(rc == 0);
         print_conn_desc(&desc);
         runtime_status_set_ble_interval(desc.conn_itvl);
-        if (g_device_status == DEV_ADV_IND) {
-          g_console_ns2.ble_addr.type = desc.peer_ota_addr.type;
-          memcpy(g_console_ns2.ble_addr.val, desc.peer_ota_addr.val, 6);
-          ESP_LOGI(LOG_BLE_GAP, "connected, set nintendo switch addr, addr=");
-          log_print_addr(g_console_ns2.ble_addr.val);
-          struct ble_gap_upd_params params;
-          memset(&params, 0, sizeof(params));
-          // ESP-IDF 5.5.3, maybe esp-idf support min connection interval
-          // Switch 2 operates at 5 ms (4 * 1.25 ms). A broad maximum here
-          // allowed the initial interval, sometimes close to one second.
-          params.itvl_min = 4;
-          params.itvl_max = 4;
-          params.latency = 0;
-          params.supervision_timeout = desc.supervision_timeout;
-          rc = ble_gap_update_params(event->connect.conn_handle, &params);
-          if (rc != 0) {
-            ESP_LOGE(LOG_BLE_GAP, "failed to update connection parameters, rc=%d", rc);
-          }
-        } else {
-          ESP_LOGE(LOG_BLE_GAP, "device not ready, reset device");
-          device_status_set(DEV_BOOT);
+        g_console_ns2s[slot].ble_addr.type = desc.peer_ota_addr.type;
+        memcpy(g_console_ns2s[slot].ble_addr.val, desc.peer_ota_addr.val,
+               ESP_BD_ADDR_LEN);
+        g_console_ns2s[slot].conn_handle = desc.conn_handle;
+        controller_handle_t *ctrl = controller_hid_for_slot(slot);
+        if (ctrl != NULL) {
+          ctrl->conn_handle = desc.conn_handle;
+          ctrl->notify_enabled = false;
         }
-        // cancel pending restart advertising timer
-        if (s_restart_adv_timer != NULL) {
-          xTimerStop(s_restart_adv_timer, 0);
+        device_slot_update(slot, DEV_CONNECTED, desc.conn_handle,
+                           desc.conn_itvl, -1);
+        ESP_LOGI(LOG_BLE_GAP,
+                 "slot %u connected, set nintendo switch addr", slot);
+        log_print_addr(g_console_ns2s[slot].ble_addr.val);
+
+        struct ble_gap_upd_params params;
+        memset(&params, 0, sizeof(params));
+        params.itvl_min = 4;
+        params.itvl_max = 4;
+        params.latency = 0;
+        params.supervision_timeout = desc.supervision_timeout;
+        rc = ble_gap_update_params(desc.conn_handle, &params);
+        if (rc != 0) {
+          ESP_LOGE(LOG_BLE_GAP,
+                   "slot %u connection parameter update failed, rc=%d",
+                   slot, rc);
+        }
+        if (s_restart_adv_timers[slot] != NULL) {
+          xTimerStop(s_restart_adv_timers[slot], 0);
         }
       } else {
-        // failed, restart advertising
-        ESP_LOGE(LOG_BLE_GAP, "connection failed, status=%d, restart advertising",
-          event->connect.status);
-        ble_advertise();
+        ESP_LOGE(LOG_BLE_GAP,
+                 "slot %u connection failed, status=%d", slot,
+                 event->connect.status);
+        ble_advertise(slot);
       }
       return 0;
-    case BLE_GAP_EVENT_DISCONNECT:
-      ESP_LOGI(LOG_BLE_GAP, "disconnected, reason=%d, restart advertising after 5s", event->disconnect.reason);
-      if (s_restart_adv_timer == NULL) {
-        s_restart_adv_timer = xTimerCreate("restart_adv", pdMS_TO_TICKS(3000), pdFALSE, NULL, restart_adv_timer_cb);
+    }
+    case BLE_GAP_EVENT_DISCONNECT: {
+      uint16_t conn_handle = event->disconnect.conn.conn_handle;
+      uint8_t slot = event_slot(arg, conn_handle);
+      ESP_LOGI(LOG_BLE_GAP,
+               "slot %u disconnected, reason=%d, restart advertising after 3s",
+               slot, event->disconnect.reason);
+      controller_handle_t *ctrl = controller_hid_for_slot(slot);
+      if (ctrl != NULL) {
+        ctrl->ops->stop_task(ctrl);
+        ctrl->notify_enabled = false;
+        ctrl->conn_handle = BLE_HS_CONN_HANDLE_NONE;
       }
-      if (s_restart_adv_timer != NULL) {
-        xTimerReset(s_restart_adv_timer, 0);
-      }
-      // stop hid task
-      g_hid_controller.ops->stop_task(&g_hid_controller);
+      g_console_ns2s[slot].conn_handle = BLE_HS_CONN_HANDLE_NONE;
+      device_slot_update(slot, DEV_DISCONNECTED, BLE_HS_CONN_HANDLE_NONE, 0,
+                         event->disconnect.reason);
+      schedule_advertising_restart(slot);
       return 0;
-    case BLE_GAP_EVENT_CONN_UPDATE:
-      ESP_LOGD(LOG_BLE_GAP, "connection updated, conn_handle=%d, status=%d",
-        event->conn_update.conn_handle, event->conn_update.status);
-      if (ble_gap_conn_find(event->conn_update.conn_handle, &desc) == 0)
+    }
+    case BLE_GAP_EVENT_CONN_UPDATE: {
+      uint8_t slot = event_slot(arg, event->conn_update.conn_handle);
+      ESP_LOGD(LOG_BLE_GAP,
+               "slot %u connection updated, handle=%d, status=%d", slot,
+               event->conn_update.conn_handle, event->conn_update.status);
+      if (ble_gap_conn_find(event->conn_update.conn_handle, &desc) == 0) {
         runtime_status_set_ble_interval(desc.conn_itvl);
+        device_slot_update(slot, device_status_get(slot), desc.conn_handle,
+                           desc.conn_itvl, -1);
+      }
       return 0;
+    }
     case BLE_GAP_EVENT_CONN_UPDATE_REQ:
-      ESP_LOGD(LOG_BLE_GAP, "connection update request, conn_handle=%d", event->conn_update_req.conn_handle);
-      // set conn params
       *event->conn_update_req.self_params = *event->conn_update_req.peer_params;
       return 0;
     case BLE_GAP_EVENT_ADV_COMPLETE:
-      ESP_LOGI(LOG_BLE_GAP, "adv complete");
+      ESP_LOGI(LOG_BLE_GAP, "advertising complete for slot %u",
+               (uint8_t)(uintptr_t)arg);
       return 0;
     case BLE_GAP_EVENT_ENC_CHANGE:
-      ESP_LOGI(LOG_BLE_GAP, "encryption change event; status=%d ", event->enc_change.status);
       rc = ble_gap_conn_find(event->enc_change.conn_handle, &desc);
-      assert(rc == 0);
-      print_conn_desc(&desc);
+      if (rc == 0) print_conn_desc(&desc);
       return 0;
     case BLE_GAP_EVENT_PASSKEY_ACTION:
-      ESP_LOGD(LOG_BLE_GAP, "passkey action event; action=%d", event->passkey.params.action);
       return 0;
     case BLE_GAP_EVENT_NOTIFY_TX:
-      ESP_LOGD(LOG_BLE_GAP, "notify_tx event; conn_handle=%d attr_handle=%d "
-        "status=%d is_indication=%d",
-        event->notify_tx.conn_handle,
-        event->notify_tx.attr_handle,
-        event->notify_tx.status,
-        event->notify_tx.indication);
-      controller_hid_notify_complete(event->notify_tx.attr_handle,
+      controller_hid_notify_complete(event->notify_tx.conn_handle,
+                                     event->notify_tx.attr_handle,
                                      event->notify_tx.status);
       return 0;
-    case BLE_GAP_EVENT_SUBSCRIBE:
-      ESP_LOGI(LOG_BLE_GAP, "subscribe event; conn_handle=0x00%02x attr_handle=0x00%02x "
-        "reason=%d prevn=%d curn=%d previ=%d curi=%d\n",
-        event->subscribe.conn_handle,
-        event->subscribe.attr_handle,
-        event->subscribe.reason,
-        event->subscribe.prev_notify,
-        event->subscribe.cur_notify,
-        event->subscribe.prev_indicate,
+    case BLE_GAP_EVENT_SUBSCRIBE: {
+      uint8_t slot = event_slot(arg, event->subscribe.conn_handle);
+      controller_handle_t *ctrl = controller_hid_for_slot(slot);
+      ESP_LOGI(LOG_BLE_GAP,
+        "slot %u subscribe event; conn_handle=0x%04x attr_handle=0x%04x "
+        "reason=%d prevn=%d curn=%d previ=%d curi=%d",
+        slot, event->subscribe.conn_handle, event->subscribe.attr_handle,
+        event->subscribe.reason, event->subscribe.prev_notify,
+        event->subscribe.cur_notify, event->subscribe.prev_indicate,
         event->subscribe.cur_indicate);
-      // cccd subscribe
-      subscribe_entry_set(event->subscribe.attr_handle,
-        event->subscribe.conn_handle,
-        event->subscribe.cur_notify == 1,
-        event->subscribe.cur_indicate == 1);
-
-      if (event->subscribe.attr_handle == g_hid_controller.ns2_notification_handle) {
-        if (event->subscribe.cur_notify == 0) {
-          g_hid_controller.ops->stop_task(&g_hid_controller);
-        } else if (event->subscribe.cur_notify == 1 &&
-                   event->subscribe.prev_notify == 0) {
-          // Stop before resetting buffers so the report task can never race a
-          // rapid unsubscribe/resubscribe sequence.
-          g_hid_controller.ops->stop_task(&g_hid_controller);
-          g_hid_controller.ops->hid_reset(&g_hid_controller);
-          g_hid_controller.ops->start_task(&g_hid_controller);
+      if (ctrl != NULL &&
+          event->subscribe.attr_handle == ctrl->ns2_notification_handle) {
+        ctrl->notify_enabled = event->subscribe.cur_notify == 1;
+        if (!ctrl->notify_enabled) {
+          ctrl->ops->stop_task(ctrl);
+        } else if (event->subscribe.prev_notify == 0) {
+          ctrl->ops->stop_task(ctrl);
+          ctrl->ops->hid_reset(ctrl);
+          ctrl->ops->start_task(ctrl);
         }
       }
-      break;
-    case BLE_GAP_EVENT_MTU:
-      ESP_LOGD(LOG_BLE_GAP, "mtu changed, conn_handle=%d, channel_id=%d, mtu=%d",
-        event->mtu.conn_handle, event->mtu.channel_id, event->mtu.value);
       return 0;
+    }
+    case BLE_GAP_EVENT_MTU: {
+      uint8_t slot = event_slot(arg, event->mtu.conn_handle);
+      g_console_ns2s[slot].mtu = event->mtu.value;
+      return 0;
+    }
     case BLE_GAP_EVENT_REPEAT_PAIRING:
       rc = ble_gap_conn_find(event->repeat_pairing.conn_handle, &desc);
       assert(rc == 0);
       ble_store_util_delete_peer(&desc.peer_id_addr);
       return BLE_GAP_REPEAT_PAIRING_RETRY;
+    // ESP-IDF 6.0.1's esp-nimble API intentionally exposes this historical
+    // spelling; keep it until the pinned framework changes.
     case BLE_GAP_EVENT_PARING_COMPLETE:
-      ESP_LOGD(LOG_BLE_GAP, "paring complete event; status=%d",
-        event->pairing_complete.status);
-      return 0;
     case BLE_GAP_EVENT_AUTHORIZE:
-      ESP_LOGD(LOG_BLE_GAP, "authorize event; conn_handle=%d", event->authorize.conn_handle);
       return 0;
     default:
       break;

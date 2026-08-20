@@ -2,6 +2,7 @@
 #include "controller/controller.h"
 #include "utils.h"
 #include "pro2.h"
+#include "multi_controller.h"
 
 #include "esp_log.h"
 
@@ -17,6 +18,7 @@ controller_firmware_t g_controller_firmware = {
         0xBA, 0x2B, 0x63, 0x25, 0xC4, 0x1A, 0x5F, 0x10
     },
     .type = CONTROLLER_TYPE_PRO2,
+    .pairing_saved = false,
     .manufacturer_data = {
         0x53, 0x05,                                 // Manufacturer ID, Nintendo
         0x01, 0x00, 0x03,                           // fixed, Maybe Version
@@ -30,15 +32,30 @@ controller_firmware_t g_controller_firmware = {
     }
 };
 
+static uint8_t s_controller_addresses_re[CONTROLLER_SLOT_COUNT][ESP_BD_ADDR_LEN];
 
-static void ltk_sec_init() {
+void controller_addresses_init(void) {
+  for (uint8_t slot = 0; slot < CONTROLLER_SLOT_COUNT; slot++) {
+    multi_controller_derive_random_address(
+        g_controller_firmware.addr_re, slot,
+        s_controller_addresses_re[slot]);
+  }
+}
+
+const uint8_t *controller_address_re(uint8_t slot) {
+  return slot < CONTROLLER_SLOT_COUNT ? s_controller_addresses_re[slot] : NULL;
+}
+
+
+static bool ltk_sec_init(uint8_t slot) {
   if (g_ltk_sec == NULL) {
       g_ltk_sec = (struct ble_store_value_sec *)malloc(sizeof(struct ble_store_value_sec));
       if (g_ltk_sec == NULL) {
           ESP_LOGE(LOG_APP, "malloc failed");
-          return;
+          return false;
       }
   }
+  memset(g_ltk_sec, 0, sizeof(*g_ltk_sec));
   g_ltk_sec->bond_count = 1;
   g_ltk_sec->key_size = LTK_KEY_SIZE;
   // use little endian ltk
@@ -46,7 +63,8 @@ static void ltk_sec_init() {
   g_ltk_sec->ltk_present = 1;
   g_ltk_sec->peer_addr.type = BLE_ADDR_PUBLIC;
   // use little endian addr
-  memcpy(g_ltk_sec-> peer_addr.val, g_console_ns2.ble_addr.val, ESP_BD_ADDR_LEN);
+  memcpy(g_ltk_sec->peer_addr.val, g_console_ns2s[slot].ble_addr.val,
+         ESP_BD_ADDR_LEN);
   // NS2 rand_num and ediv are both 0
   g_ltk_sec->rand_num = 0;
   g_ltk_sec->ediv = 0;
@@ -54,12 +72,14 @@ static void ltk_sec_init() {
   // g_ltk_sec->irk_present = 0;
   g_ltk_sec->authenticated = 1;
   g_ltk_sec->sc = 1;
+  return true;
 }
 
-int inject_pairing_info_to_ble_ctx() {
+int inject_pairing_info_to_ble_ctx(uint8_t slot) {
+  if (slot >= CONTROLLER_SLOT_COUNT) return BLE_HS_EINVAL;
   int rc = 0;
   // init esp ble ltk sec
-  ltk_sec_init();
+  if (!ltk_sec_init(slot)) return BLE_HS_ENOMEM;
   // write ltk to ble context
   rc = ble_store_write_our_sec(g_ltk_sec);
   if (rc != 0) {
@@ -77,7 +97,7 @@ int inject_pairing_info_to_ble_ctx() {
 
   // TIP: Maybe not necessary to call this function
   // manual binding, execute initial binding logic
-  // ble_gatts_bonding_established(g_console_ns2.conn_handle);
+  // ble_gatts_bonding_established(g_console_ns2s[slot].conn_handle);
 
   return rc;
 }
@@ -119,9 +139,9 @@ int controller_init(nvs_handle_t nvs_handle) {
     return ESP_FAIL;
 }
 
-int controller_pairing_info_save(void) {
+int controller_pairing_info_save(uint8_t slot) {
     if (g_controller_firmware.type == CONTROLLER_TYPE_PRO2) {
-        return pro2_pairing_info_save();
+        return pro2_pairing_info_save(slot);
     }
     ESP_LOGE(LOG_APP, "JoyCon pairing info save not implemented");
     return -1;

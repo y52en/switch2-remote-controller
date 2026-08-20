@@ -7,6 +7,10 @@
 #include "esp_err.h"
 #include "esp_log.h"
 #include "nvs_flash.h"
+#include "driver/usb_serial_jtag.h"
+
+#include <stdio.h>
+#include <stdint.h>
 
 #include "nimble/ble.h"
 #include "nimble/nimble_port.h"
@@ -16,10 +20,69 @@
 #include "host/ble_att.h"
 #include "host/util/util.h"
 
-device_status_t g_device_status = DEV_BOOT;
+device_slot_state_t g_device_slots[CONTROLLER_SLOT_COUNT] = {
+  [0 ... CONTROLLER_SLOT_COUNT - 1] = {
+    .status = DEV_BOOT,
+    .conn_handle = BLE_HS_CONN_HANDLE_NONE,
+    .conn_interval = 0,
+  },
+};
 
-void device_status_set(device_status_t status) {
-  g_device_status = status;
+static const char *device_status_name(device_status_t status) {
+  switch (status) {
+    case DEV_ADV_IND: return "advertising";
+    case DEV_CONNECTED: return "connected";
+    case DEV_READY: return "ready";
+    case DEV_DISCONNECTED: return "disconnected";
+    default: return "disconnected";
+  }
+}
+
+static void device_slot_publish(uint8_t slot, int disconnect_reason) {
+  const device_slot_state_t *state = &g_device_slots[slot];
+  char line[64];
+  int length = disconnect_reason >= 0
+    ? snprintf(line, sizeof(line), "DS:%u:%s:%u:%d\n", slot,
+               device_status_name(state->status), state->conn_interval,
+               disconnect_reason)
+    : snprintf(line, sizeof(line), "DS:%u:%s:%u\n", slot,
+               device_status_name(state->status), state->conn_interval);
+  if (length > 0 && length < (int)sizeof(line)) {
+    usb_serial_jtag_write_bytes(line, (size_t)length, 0);
+  }
+}
+
+void device_slot_update(uint8_t slot, device_status_t status,
+    uint16_t conn_handle, uint16_t conn_interval, int disconnect_reason) {
+  if (slot >= CONTROLLER_SLOT_COUNT) return;
+  g_device_slots[slot].status = status;
+  g_device_slots[slot].conn_handle = conn_handle;
+  g_device_slots[slot].conn_interval = conn_interval;
+  device_slot_publish(slot, disconnect_reason);
+}
+
+void device_status_set(uint8_t slot, device_status_t status) {
+  if (slot >= CONTROLLER_SLOT_COUNT) return;
+  device_slot_update(slot, status, g_device_slots[slot].conn_handle,
+                     g_device_slots[slot].conn_interval, -1);
+}
+
+device_status_t device_status_get(uint8_t slot) {
+  return slot < CONTROLLER_SLOT_COUNT ? g_device_slots[slot].status : DEV_BOOT;
+}
+
+int device_slot_from_conn(uint16_t conn_handle) {
+  if (conn_handle == BLE_HS_CONN_HANDLE_NONE) return -1;
+  for (uint8_t slot = 0; slot < CONTROLLER_SLOT_COUNT; slot++) {
+    if (g_device_slots[slot].conn_handle == conn_handle) return slot;
+  }
+  return -1;
+}
+
+void device_status_publish_all(void) {
+  for (uint8_t slot = 0; slot < CONTROLLER_SLOT_COUNT; slot++) {
+    device_slot_publish(slot, -1);
+  }
 }
 
 struct ble_store_value_sec* g_ltk_sec = NULL;
@@ -39,11 +102,17 @@ static void nvs_init() {
 
 static esp_err_t ns2_addr_init(nvs_handle_t nvs_handle) {
   esp_err_t ret;
-  ret = nvs_get_blob(nvs_handle, NVS_KEY_HOST_ADDR, g_console_ns2.ble_addr.val, &(size_t){ESP_BD_ADDR_LEN});
+  ret = nvs_get_blob(nvs_handle, NVS_KEY_HOST_ADDR,
+                     g_console_ns2s[0].ble_addr.val,
+                     &(size_t){ESP_BD_ADDR_LEN});
   if (ret != ESP_OK) {
     ESP_LOGE(LOG_BLE_NVS, "Failed to get NS2 addr from NVS");
   } else {
     ESP_LOGI(LOG_BLE_NVS, "NS2 addr loaded from NVS");
+    for (uint8_t slot = 1; slot < CONTROLLER_SLOT_COUNT; slot++) {
+      memcpy(g_console_ns2s[slot].ble_addr.val,
+             g_console_ns2s[0].ble_addr.val, ESP_BD_ADDR_LEN);
+    }
   }
   return ret;
 }
@@ -66,9 +135,20 @@ static esp_err_t device_info_init() {
 
     ret = ns2_addr_init(nvs_handle);
     if (ret == ESP_OK) {
-        g_console_ns2.ble_addr.type = BLE_ADDR_PUBLIC;
+        for (uint8_t slot = 0; slot < CONTROLLER_SLOT_COUNT; slot++) {
+          g_console_ns2s[slot].ble_addr.type = BLE_ADDR_PUBLIC;
+        }
         // set ns2 address to manufacturer data (little endian)
-        memcpy(&g_controller_firmware.manufacturer_data[12], g_console_ns2.ble_addr.val, ESP_BD_ADDR_LEN);
+        memcpy(&g_controller_firmware.manufacturer_data[12],
+               g_console_ns2s[0].ble_addr.val, ESP_BD_ADDR_LEN);
+        if (!g_controller_firmware.pairing_saved) {
+          ESP_LOGW(LOG_BLE_NVS, "Host address exists without an LTK; pairing again");
+          ret = ESP_ERR_NVS_NOT_FOUND;
+        }
+    } else {
+        // An LTK without its peer address is not a usable bond and must never
+        // be injected for the all-zero default peer during NimBLE sync.
+        g_controller_firmware.pairing_saved = false;
     }
     nvs_close(nvs_handle);
     return ret;
@@ -85,11 +165,14 @@ static uint8_t own_addr_type;
 static void bleprph_on_sync(void) {
   ESP_ERROR_CHECK(ble_hs_util_ensure_addr(0));
   ESP_ERROR_CHECK(ble_hs_id_infer_auto(0, &own_addr_type));
-  log_print_addr(g_controller_firmware.addr_re);
+  for (uint8_t slot = 0; slot < CONTROLLER_SLOT_COUNT; slot++) {
+    ESP_LOGI(LOG_APP, "controller slot %u address:", slot);
+    log_print_addr(controller_address_re(slot));
+  }
 
   // already paired, inject pairing info to BLE context
-  if (g_controller_firmware.ltk[0] != 0) {
-    int rc = inject_pairing_info_to_ble_ctx();
+  if (g_controller_firmware.pairing_saved) {
+    int rc = inject_pairing_info_to_ble_ctx(0);
     if (rc != 0) {
       ESP_LOGE(LOG_APP, "Failed to inject pairing info to BLE context");
     } else {
@@ -101,7 +184,7 @@ static void bleprph_on_sync(void) {
     ble_gap_set_prefered_default_le_phy(BLE_HCI_LE_PHY_2M_PREF_MASK, BLE_HCI_LE_PHY_2M_PREF_MASK)
   );
 
-  ble_advertise();
+  ble_advertise_all();
 }
 
 void host_task(void *param) {
@@ -170,80 +253,17 @@ void ble_stack_init(void) {
 
 // **************** BLE Advertise ****************
 
-static uint8_t instance = 0;
-
-/**
- * legacy advertising, not used
- */
-#if 0
-static void ble_advertise_normal() {
+void ble_advertise(uint8_t slot) {
   int rc;
-  // reset device status
+  if (slot >= CONTROLLER_SLOT_COUNT) return;
   if (g_controller_firmware.type == CONTROLLER_TYPE_JOYCON) {
-    // TODO Joycon
     ESP_LOGE(LOG_APP, "Joycon not implemented");
     return;
   }
-  device_status_set(DEV_ADV_IND);
+  device_slot_update(slot, DEV_ADV_IND, BLE_HS_CONN_HANDLE_NONE, 0, -1);
 
-  if (ble_gap_adv_active()) {
-    ESP_LOGI(LOG_APP, "Advertising instance already active");
-    return;
-  }
-  struct ble_gap_adv_params adv_params;
-
-  memset(&adv_params, 0, sizeof(adv_params));
-  adv_params.conn_mode = BLE_GAP_CONN_MODE_UND;
-  adv_params.disc_mode = BLE_GAP_DISC_MODE_GEN;
-  adv_params.itvl_min = BLE_GAP_ADV_FAST_INTERVAL1_MIN;
-  adv_params.itvl_max = BLE_GAP_ADV_FAST_INTERVAL1_MIN;
-
-  // set manufacturer data
-  ESP_LOGI(LOG_APP, "Setting manufacturer data for advertising");
-  uint8_t m_head[3] = { 0x02, 0x01, 0x06 };
-  uint8_t m_size = sizeof(g_controller_firmware.manufacturer_data) + 1; // 27
-  uint8_t m_spec[2] = { m_size, 0xFF };
-  uint8_t adv_data[sizeof(m_head) + sizeof(m_spec) + sizeof(g_controller_firmware.manufacturer_data)];
-  memcpy(adv_data, m_head, sizeof(m_head));
-  memcpy(adv_data + sizeof(m_head), m_spec, sizeof(m_spec));
-  // TODO test wakeup flag
-  if (g_adv_opcode != 0x00) {
-    g_controller_firmware.manufacturer_data[11] = g_adv_opcode;
-  }
-  memcpy(adv_data + sizeof(m_head) + sizeof(m_spec),
-         g_controller_firmware.manufacturer_data,
-         sizeof(g_controller_firmware.manufacturer_data));
-
-  rc = ble_gap_adv_set_data(adv_data, sizeof(adv_data));
-  if (rc != 0) {
-    ESP_LOGE(LOG_APP, "Error setting manufacturer data for advertising; rc=%d", rc);
-    return;
-  }
-
-  // start advertising
-  rc = ble_gap_adv_start(own_addr_type, NULL, BLE_HS_FOREVER, &adv_params, handle_gap_event, NULL);
-  if (rc != 0) {
-    ESP_LOGE(LOG_APP, "Error enabling extended advertising; rc=%d", rc);
-    return;
-  }
-
-}
-#endif
-
-void ble_advertise() {
-  // ble_advertise_normal();
-  int rc;
-  // reset device status
-  if (g_controller_firmware.type == CONTROLLER_TYPE_JOYCON) {
-    // TODO Joycon
-    ESP_LOGE(LOG_APP, "Joycon not implemented");
-    return;
-  }
-  device_status_set(DEV_ADV_IND);
-
-  // only one instance advertising
-  if (ble_gap_ext_adv_active(instance)) {
-    ESP_LOGI(LOG_APP, "Advertising instance %d already active", instance);
+  if (ble_gap_ext_adv_active(slot)) {
+    ESP_LOGI(LOG_APP, "Advertising instance %u already active", slot);
     return;
   }
 
@@ -255,22 +275,33 @@ void ble_advertise() {
   ext_adv_params.scannable = 1;
   ext_adv_params.directed = 0;
 
-  ext_adv_params.own_addr_type = BLE_OWN_ADDR_PUBLIC;
+  ext_adv_params.own_addr_type = slot == 0
+    ? BLE_OWN_ADDR_PUBLIC : BLE_OWN_ADDR_RANDOM;
   ext_adv_params.primary_phy = BLE_HCI_LE_PHY_1M;
   ext_adv_params.secondary_phy = BLE_HCI_LE_PHY_1M;
   ext_adv_params.itvl_min = BLE_GAP_ADV_FAST_INTERVAL1_MIN; // 30ms
   ext_adv_params.itvl_max = BLE_GAP_ADV_FAST_INTERVAL1_MIN; // 30ms
   ext_adv_params.channel_map = BLE_GAP_ADV_DFLT_CHANNEL_MAP;
-  ext_adv_params.sid = 0;
+  ext_adv_params.sid = slot;
   // ext_adv_params.tx_power = 127;
   ext_adv_params.scan_req_notif = false;
   ext_adv_params.filter_policy = BLE_HCI_SCAN_FILT_NO_WL;
 
-  rc = ble_gap_ext_adv_configure(instance,
-    &ext_adv_params, NULL, handle_gap_event, NULL);
+  rc = ble_gap_ext_adv_configure(slot, &ext_adv_params, NULL,
+    handle_gap_event, (void *)(uintptr_t)slot);
   if (rc != 0) {
-    ESP_LOGE(LOG_APP, "Error configuring extended advertising instance %d; rc=%d", instance, rc);
+    ESP_LOGE(LOG_APP, "Error configuring advertising slot %u; rc=%d", slot, rc);
     return;
+  }
+
+  if (slot > 0) {
+    ble_addr_t random_addr = { .type = BLE_ADDR_RANDOM };
+    memcpy(random_addr.val, controller_address_re(slot), ESP_BD_ADDR_LEN);
+    rc = ble_gap_ext_adv_set_addr(slot, &random_addr);
+    if (rc != 0) {
+      ESP_LOGE(LOG_APP, "Error setting random address for slot %u; rc=%d", slot, rc);
+      return;
+    }
   }
 
   // set manufacturer data
@@ -289,18 +320,23 @@ void ble_advertise() {
   if (g_adv_opcode != 0x00) {
     g_controller_firmware.manufacturer_data[11] = g_adv_opcode;
     // restart adv must set ns2 addr
-    memcpy(&g_controller_firmware.manufacturer_data[12], g_console_ns2.ble_addr.val, ESP_BD_ADDR_LEN);
+    memcpy(&g_controller_firmware.manufacturer_data[12],
+           g_console_ns2s[slot].ble_addr.val, ESP_BD_ADDR_LEN);
   }
   memcpy(m_data + sizeof(m_head) + sizeof(m_spec), g_controller_firmware.manufacturer_data, sizeof(g_controller_firmware.manufacturer_data));
 
   adv_data = os_msys_get_pkthdr(sizeof(m_data), 0);
+  if (adv_data == NULL) {
+    ESP_LOGE(LOG_APP, "Failed to allocate advertising data for slot %u", slot);
+    return;
+  }
   rc = os_mbuf_append(adv_data, m_data, sizeof(m_data));
   if (rc != 0) {
     ESP_LOGE(LOG_APP, "Error appending manufacturer data to mbuf; rc=%d", rc);
     os_mbuf_free_chain(adv_data);
     return;
   }
-  rc = ble_gap_ext_adv_set_data(instance, adv_data);
+  rc = ble_gap_ext_adv_set_data(slot, adv_data);
   if (rc != 0) {
     ESP_LOGE(LOG_APP, "Error setting manufacturer data for advertising; rc=%d", rc);
     os_mbuf_free_chain(adv_data);
@@ -308,10 +344,16 @@ void ble_advertise() {
   }
 
   // start advertising
-  rc = ble_gap_ext_adv_start(instance, 0, 0);
+  rc = ble_gap_ext_adv_start(slot, 0, 0);
   if (rc != 0) {
-    ESP_LOGE(LOG_APP, "Error enabling extended advertising; rc=%d", rc);
+    ESP_LOGE(LOG_APP, "Error enabling advertising slot %u; rc=%d", slot, rc);
     return;
+  }
+}
+
+void ble_advertise_all(void) {
+  for (uint8_t slot = 0; slot < CONTROLLER_SLOT_COUNT; slot++) {
+    ble_advertise(slot);
   }
 }
 
@@ -415,7 +457,7 @@ int custom_store_config_write(int obj_type, const union ble_store_value *val) {
 }
 
 int custom_store_gen_key_cb(uint8_t key,struct ble_store_gen_key *gen_key, uint16_t conn_handle) {
-  if (key == BLE_STORE_GEN_KEY_LTK && conn_handle == g_console_ns2.conn_handle) {
+  if (key == BLE_STORE_GEN_KEY_LTK && device_slot_from_conn(conn_handle) >= 0) {
         ESP_LOGD(LOG_APP, "call custom_store_gen_key_cb LTK");
         // Only intercept LTK generation and verify conn_handle ,wait testing
         // copy ltk to KEY generate callback function

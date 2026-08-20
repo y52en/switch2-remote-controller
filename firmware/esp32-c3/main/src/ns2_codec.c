@@ -4,8 +4,14 @@
 #include "controller/controller.h"
 #include "controller/hid_controller_pro2.h"
 #include "utils.h"
+#include "multi_controller.h"
 
 #include "host/ble_att.h"
+
+// NimBLE dispatches GATT access callbacks serially on the host task. Keep the
+// current connection slot available to the existing command-handler table
+// without changing every handler signature.
+static uint8_t s_controller_slot;
 
 /**
  * @brief FLASH MEMORY SIM, Necessary for the BLE stack to work
@@ -343,7 +349,7 @@ static uint8_t cmd_0x0c_handler(const uint8_t subcmd, const uint16_t payload_len
         case 0x04:
             // TODO The hid_task is blocked during reconnection to avoid resource occupation.
             // yet the issue remains unresolved and pending further handling.
-            device_status_set(DEV_READY);
+            device_status_set(s_controller_slot, DEV_READY);
             memset(data_out, 0x00, 0x04);
             return 0x04;
         // set feature mask
@@ -432,18 +438,21 @@ static uint8_t cmd_0x15_handler(const uint8_t subcmd, const uint16_t payload_len
             uint8_t mac_addr[ESP_BD_ADDR_LEN] = { 0x00 };
             memcpy(mac_addr, data_in + 10, ESP_BD_ADDR_LEN);
             // ns2 mac addr check
-            if (memcmp(g_console_ns2.ble_addr.val, mac_addr, ESP_BD_ADDR_LEN) == 0) {
+            if (memcmp(g_console_ns2s[s_controller_slot].ble_addr.val, mac_addr,
+                       ESP_BD_ADDR_LEN) == 0) {
                 data_out[0] = 0x01;     // fixed
                 data_out[1] = 0x04;     // magic
                 data_out[2] = 0x01;     // size?
                 // response controller mac addr (little endian)
-                memcpy(data_out + 3, g_controller_firmware.addr_re, ESP_BD_ADDR_LEN);
+                memcpy(data_out + 3,
+                       controller_address_re(s_controller_slot),
+                       ESP_BD_ADDR_LEN);
                 return ESP_BD_ADDR_LEN + 3;
             } else {
                 ESP_LOGW(LOG_APP, "remote NS2 address:");
                 log_print_addr(mac_addr);
                 ESP_LOGW(LOG_APP, "local NS2 address:");
-                log_print_addr(g_console_ns2.ble_addr.val);
+                log_print_addr(g_console_ns2s[s_controller_slot].ble_addr.val);
                 ESP_LOGE(LOG_APP, "NS2 address mismatch");
             }
             return 0x00;
@@ -455,10 +464,11 @@ static uint8_t cmd_0x15_handler(const uint8_t subcmd, const uint16_t payload_len
 
             log_print_ltk_hex("LTK A1:", ltk_A1);
 
-            // generate ltk
-            for (int i = 0; i < LTK_KEY_SIZE; i++) {
-                g_controller_firmware.ltk[i] = ltk_A1[LTK_KEY_SIZE - i - 1] ^ g_controller_firmware.ltk_key_b1[LTK_KEY_SIZE - i - 1];
-            }
+            // NimBLE stores security by peer address, while the console opens
+            // three links to three local identities. Derive B1 so each custom
+            // pairing exchange resolves to the one persisted shared LTK.
+            multi_controller_derive_b1(g_controller_firmware.ltk, ltk_A1,
+                                       g_controller_firmware.ltk_key_b1);
 
             // always response B1
             data_out[0] = 0x01;
@@ -495,8 +505,8 @@ static uint8_t cmd_0x15_handler(const uint8_t subcmd, const uint16_t payload_len
         case 0x03:
             // TODO 00 ? before index 9 ? WHY 8?
             if (data_in[8] == 0x00 || data_in[9] == 0x00) {
-                rc = controller_pairing_info_save();
-                rc += inject_pairing_info_to_ble_ctx();
+                rc = controller_pairing_info_save(s_controller_slot);
+                rc += inject_pairing_info_to_ble_ctx(s_controller_slot);
 
                 if (rc == 0) {
                     data_out[0] = 0x01;
@@ -599,7 +609,10 @@ cmd_handler cmd_handler_find(uint8_t cmd) {
 
 #define CMD_PROCESS_MAX_RSP_DATA_LEN 0x78
 
-int cmd_process(pro2_gatt_rsp_t* rsp, uint8_t* data_in, uint16_t payload_len) {
+int cmd_process(pro2_gatt_rsp_t* rsp, uint8_t* data_in, uint16_t payload_len,
+                uint8_t controller_slot) {
+    if (controller_slot >= CONTROLLER_SLOT_COUNT) return BLE_ATT_ERR_UNLIKELY;
+    s_controller_slot = controller_slot;
     uint8_t rsp_magic[4] = { 0x10, 0x78, 0x00, 0x00 };
     uint8_t *data_out = (uint8_t*) malloc(CMD_PROCESS_MAX_RSP_DATA_LEN * sizeof(uint8_t));
     if (data_out == NULL) {

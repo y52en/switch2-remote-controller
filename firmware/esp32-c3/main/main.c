@@ -50,11 +50,14 @@ void app_main(void)
     // Determine controller type from NVS
     controller_type_init();
 
-    // Initialize controller (HID)
-    if (g_hid_controller.ops->init(&g_hid_controller, g_controller_firmware.type) == 0) {
-        ESP_LOGI(LOG_APP, "Controller initialized");
-    } else {
-        ESP_LOGE(LOG_APP, "Failed to initialize controller");
+    // Initialize one independent HID state pipeline per BLE identity.
+    for (uint8_t slot = 0; slot < CONTROLLER_SLOT_COUNT; slot++) {
+        controller_handle_t *controller = controller_hid_for_slot(slot);
+        if (controller->ops->init(controller, g_controller_firmware.type) == 0) {
+            ESP_LOGI(LOG_APP, "Controller slot %u initialized", slot);
+        } else {
+            ESP_LOGE(LOG_APP, "Failed to initialize controller slot %u", slot);
+        }
     }
 
     // Initialize BLE stack
@@ -63,7 +66,7 @@ void app_main(void)
 
     // Keep the main task alive
     while (1) {
-        runtime_status_update(g_device_status);
+        runtime_status_update(device_status_get(0));
         vTaskDelay(pdMS_TO_TICKS(250));
     }
 }

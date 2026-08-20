@@ -69,10 +69,16 @@ struct controller_handle {
 
     TaskHandle_t task_handle;
     uint16_t     ns2_notification_handle;
+    uint16_t     conn_handle;
+    uint8_t      slot;
+    bool         notify_enabled;
+    void        *runtime;
 };
 
-// Global controller instance
-extern controller_handle_t g_hid_controller;
+// One independent HID pipeline for each virtual BLE controller.
+extern controller_handle_t g_hid_controllers[CONTROLLER_SLOT_COUNT];
+controller_handle_t *controller_hid_for_slot(uint8_t slot);
+controller_handle_t *controller_hid_for_conn(uint16_t conn_handle);
 
 // Global controller operations
 extern const controller_ops_t controller_ops;
@@ -80,8 +86,8 @@ extern const controller_ops_t controller_ops;
 // Called from the GAP notify completion event. HID input notifications are
 // deliberately limited to one in flight so stale reports cannot accumulate
 // in NimBLE's transmit queue.
-void controller_hid_notify_complete(uint16_t attr_handle, int status);
-void controller_hid_notify_reset(void);
+void controller_hid_notify_complete(uint16_t conn_handle, uint16_t attr_handle, int status);
+void controller_hid_notify_reset(controller_handle_t *ctrl);
 
 // 12 bits stick data packed into 3 bytes
 static inline void pack_stick_data(uint8_t out[3], uint16_t x, uint16_t y) {

@@ -1,4 +1,5 @@
 #include "runtime_status.h"
+#include "device.h"
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -19,8 +20,8 @@ static uint32_t published_input_tick;
 static uint32_t published_buttons_hat;
 static uint32_t published_sticks;
 static bool published_have_input;
-static uint8_t last_input_state[7];
-static bool have_last_input_state;
+static uint8_t last_input_state[CONTROLLER_SLOT_COUNT][7];
+static bool have_last_input_state[CONTROLLER_SLOT_COUNT];
 
 static uint16_t ble_interval_units;
 static uint16_t ble_queue_free;
@@ -44,12 +45,12 @@ static uint32_t hid_notify_recoveries;
 static uint32_t ble_notifications;
 static uint32_t ble_input_changes;
 
-static uint8_t hid_enqueue_state[9];
-static uint8_t hid_dequeue_state[9];
-static uint8_t ble_notify_state[9];
-static bool have_hid_enqueue_state;
-static bool have_hid_dequeue_state;
-static bool have_ble_notify_state;
+static uint8_t hid_enqueue_state[CONTROLLER_SLOT_COUNT][9];
+static uint8_t hid_dequeue_state[CONTROLLER_SLOT_COUNT][9];
+static uint8_t ble_notify_state[CONTROLLER_SLOT_COUNT][9];
+static bool have_hid_enqueue_state[CONTROLLER_SLOT_COUNT];
+static bool have_hid_dequeue_state[CONTROLLER_SLOT_COUNT];
+static bool have_ble_notify_state[CONTROLLER_SLOT_COUNT];
 
 static uint32_t load_u32(const uint32_t *value) {
     return __atomic_load_n(value, __ATOMIC_RELAXED);
@@ -124,6 +125,7 @@ void runtime_status_get_snapshot(runtime_status_snapshot_t *snapshot) {
 }
 
 static void emit_diagnostics(void) {
+    device_status_publish_all();
     runtime_status_snapshot_t status;
     runtime_status_get_snapshot(&status);
     if (status.ble_interval_units == 0) return;
@@ -179,9 +181,10 @@ int runtime_status_init(void) {
     return result == pdPASS ? 0 : -1;
 }
 
-void runtime_status_note_input_state(uint16_t buttons, uint8_t hat,
+void runtime_status_note_input_state(uint8_t slot, uint16_t buttons, uint8_t hat,
                                      uint8_t lx, uint8_t ly,
                                      uint8_t rx, uint8_t ry) {
+    if (slot >= CONTROLLER_SLOT_COUNT) return;
     __atomic_store_n(&published_input_tick, (uint32_t)xTaskGetTickCount(), __ATOMIC_RELAXED);
     __atomic_store_n(&published_buttons_hat,
                      (uint32_t)buttons | ((uint32_t)(hat & 0x0f) << 16),
@@ -193,15 +196,17 @@ void runtime_status_note_input_state(uint16_t buttons, uint8_t hat,
     __atomic_store_n(&published_have_input, true, __ATOMIC_RELEASE);
 
     uint8_t next[] = {buttons >> 8, buttons, hat, lx, ly, rx, ry};
-    if (!have_last_input_state || memcmp(last_input_state, next, sizeof(next)) != 0) {
-        if (have_last_input_state) {
+    if (!have_last_input_state[slot] ||
+        memcmp(last_input_state[slot], next, sizeof(next)) != 0) {
+        if (have_last_input_state[slot]) {
             uint16_t previous_buttons =
-                ((uint16_t)last_input_state[0] << 8) | last_input_state[1];
+                ((uint16_t)last_input_state[slot][0] << 8) |
+                last_input_state[slot][1];
             uint32_t presses = (uint32_t)__builtin_popcount(
                 (unsigned int)(buttons & ~previous_buttons));
             uint32_t releases = (uint32_t)__builtin_popcount(
                 (unsigned int)(previous_buttons & ~buttons));
-            uint8_t previous_hat = last_input_state[2] & 0x0f;
+            uint8_t previous_hat = last_input_state[slot][2] & 0x0f;
             uint8_t next_hat = hat & 0x0f;
             if (previous_hat != next_hat) {
                 if (previous_hat != 8) releases++;
@@ -211,9 +216,11 @@ void runtime_status_note_input_state(uint16_t buttons, uint8_t hat,
             __atomic_fetch_add(&input_presses, presses, __ATOMIC_RELAXED);
             __atomic_fetch_add(&input_releases, releases, __ATOMIC_RELAXED);
         }
-        memcpy(last_input_state, next, sizeof(next));
-        have_last_input_state = true;
-        diagnostic_line("DI\n", 3);
+        memcpy(last_input_state[slot], next, sizeof(next));
+        have_last_input_state[slot] = true;
+        char line[8];
+        int length = snprintf(line, sizeof(line), "DI:%u\n", slot);
+        if (length > 0) diagnostic_line(line, (size_t)length);
     }
 }
 
@@ -235,31 +242,36 @@ void runtime_status_set_ble_queue(uint16_t free_blocks, uint16_t ceiling,
     __atomic_store_n(&ble_notify_completions, notify_completions, __ATOMIC_RELAXED);
 }
 
-void runtime_status_note_hid_enqueue(const uint8_t *report, size_t report_size,
-                                     bool dropped) {
+void runtime_status_note_hid_enqueue(uint8_t slot, const uint8_t *report,
+                                     size_t report_size, bool dropped) {
+    if (slot >= CONTROLLER_SLOT_COUNT) return;
     if (dropped) {
         __atomic_fetch_add(&hid_drops, 1, __ATOMIC_RELAXED);
         return;
     }
     __atomic_fetch_add(&hid_enqueued, 1, __ATOMIC_RELAXED);
-    if (note_report_change(report, report_size, hid_enqueue_state,
-                           &have_hid_enqueue_state)) {
+    if (note_report_change(report, report_size, hid_enqueue_state[slot],
+                           &have_hid_enqueue_state[slot])) {
         __atomic_fetch_add(&hid_enqueue_changes, 1, __ATOMIC_RELAXED);
     }
 }
 
-void runtime_status_note_hid_dequeue(const uint8_t *report, size_t report_size) {
+void runtime_status_note_hid_dequeue(uint8_t slot, const uint8_t *report,
+                                     size_t report_size) {
+    if (slot >= CONTROLLER_SLOT_COUNT) return;
     __atomic_fetch_add(&hid_dequeued, 1, __ATOMIC_RELAXED);
-    if (note_report_change(report, report_size, hid_dequeue_state,
-                           &have_hid_dequeue_state)) {
+    if (note_report_change(report, report_size, hid_dequeue_state[slot],
+                           &have_hid_dequeue_state[slot])) {
         __atomic_fetch_add(&hid_dequeue_changes, 1, __ATOMIC_RELAXED);
     }
 }
 
-void runtime_status_note_ble_report(const uint8_t *report, size_t report_size) {
+void runtime_status_note_ble_report(uint8_t slot, const uint8_t *report,
+                                    size_t report_size) {
+    if (slot >= CONTROLLER_SLOT_COUNT) return;
     __atomic_fetch_add(&ble_notifications, 1, __ATOMIC_RELAXED);
-    if (note_report_change(report, report_size, ble_notify_state,
-                           &have_ble_notify_state)) {
+    if (note_report_change(report, report_size, ble_notify_state[slot],
+                           &have_ble_notify_state[slot])) {
         __atomic_fetch_add(&ble_input_changes, 1, __ATOMIC_RELAXED);
     }
 }

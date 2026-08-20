@@ -9,7 +9,7 @@
 int pro2_device_init(nvs_handle_t nvs_handle);
 
 // Pro2 Pairing Info save
-int pro2_pairing_info_save();
+int pro2_pairing_info_save(uint8_t slot);
 
 // Pro2 Pairing Info remove
 int pro2_pairing_info_erase();
